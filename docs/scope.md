@@ -36,6 +36,13 @@ it, and ballast reports that rather than repairing it. There is no way to
 "re-point" a view at a replacement, because the replacement is a different thing
 and pretending otherwise would lose exactly the history the store exists to keep.
 
+**One output file, whatever went in.** A sharded model reads correctly — every
+`*.safetensors` in the directory is loaded — but `apply` writes a single
+`model.safetensors` and no index, which transformers loads and which is an
+unusual shape above about fifty gigabytes. The stale index from the base is
+deliberately not copied across, since it would describe shards that are no
+longer there.
+
 **Deltas, not models.** The unit is what a fine-tune changed. Full model
 directories go in and come out through `delta` and `apply`, but what is versioned
 in between is the difference. A merge that composes layer ranges rather than
