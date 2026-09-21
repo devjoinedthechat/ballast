@@ -8,11 +8,11 @@ Four of them:
 - resolving a view streams, so a merge holds one tensor per input
 
 Every scenario runs in its own process, and the fixtures it reads are built by a
-different process again. Both matter. Peak resident memory is a high-water mark
-that freeing does not lower, so a process that generated a four-gigabyte model
-before measuring reports four gigabytes whatever the measured code went on to
-do — the first version of this script did exactly that and reported the apply
-holding the whole model.
+different process again. Both matter: peak resident memory is a high-water mark
+that freeing does not lower, so a process that generates a four-gigabyte model
+before measuring reports four gigabytes whatever the measured code goes on to
+do. Measuring a scenario in the process that built its fixture measures the
+fixture.
 
     python scripts/benchmark.py            # ~4 GB of disk, a few minutes
     python scripts/benchmark.py --size s   # seconds, small enough for CI

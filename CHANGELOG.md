@@ -88,7 +88,7 @@ API is not yet stable.
   tensor, gigabytes over a model, and enough to make the streaming apply slower
   than the version that holds everything in memory. Tensors are written straight
   from the array now, and the copy is kept only for destinations with no file
-  descriptor, such as an HTTP response body. Found by the benchmark.
+  descriptor, such as an HTTP response body.
 
 - **Merging refused the ordinary case.** Two fine-tunes of the same base rarely
   touch the same tensors, so `delta` produces deltas with different tensor sets
@@ -96,10 +96,10 @@ API is not yet stable.
   is the default now — a weight an input never changed is a change of zero — and
   `--strict` asks for the old behaviour. Every view records which rule it was
   made under, so one resolved later does not depend on what the default was then.
-- **A forgotten delta went on being served.** `serve-export` skipped the work
-  when the export directory already existed, so a commit that had been deleted,
-  or a grant that had been revoked, kept being exported from the last copy. It
-  re-checks that the commit resolves on every export, which reads no tensors.
+- **An export re-checks that its commit still resolves**, on every export and
+  not only when it writes. An export is a copy that leaves the store, and a
+  deleted commit or a revoked grant must stop it being served. The check reads
+  no tensors.
 - **`slerp` was unreachable from the command line.** It resolved, it was tested,
   and `merge` had no `--t`. Every per-method parameter is a flag now, and a test
   walks every resolvable method through the CLI.

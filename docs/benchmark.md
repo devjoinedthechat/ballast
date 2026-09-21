@@ -19,16 +19,15 @@ Every scenario runs in its own process, and the fixtures it reads are built by a
 different process again.
 
 Both matter. Peak resident memory is a high-water mark that freeing does not
-lower, so a process that generated a four-gigabyte model before measuring
-reports four gigabytes whatever the measured code then does. The first version
-of this script did exactly that, and reported the streaming apply holding the
-whole model — a measurement artefact that looked like a refuted claim.
+lower, so a process that generates a four-gigabyte model before measuring
+reports four gigabytes whatever the measured code goes on to do. Measuring a
+scenario in the process that built its fixture measures the fixture.
 
 Reading a memory-mapped file also makes its pages resident, and writing one
 leaves dirty pages behind, so peak RSS for any code that streams a model through
-cannot sit far below the model itself. That is why the memory scenarios measure
-a streamed run *against* a whole one: the difference between them is the
-allocation, which is the thing actually being claimed.
+cannot sit far below the model itself. The memory scenarios therefore measure a
+streamed run *against* a whole one. The difference between the two is the
+allocation, which is what the claim is about; the floor they share is the file.
 
 ## A retrain stores what changed
 
@@ -62,8 +61,11 @@ another 1.29x off bf16 weights.
 | streamed, relative speed | 1.6x faster | 1.9x | 2.2x |
 
 At every size the difference is one model: that is the copy streaming does not
-make. It is also faster, by more as the model grows, because the copy it skips
-is the model.
+make. It is also faster, by more as the model grows, for the same reason.
+
+Tensors are written straight from the array, with no intermediate copy, so a
+write costs what the bytes cost. A destination with no file descriptor to write
+to — an HTTP response body — is the exception, and copies.
 
 ## Resolving a view holds one tensor per input
 
@@ -78,26 +80,3 @@ actually runs:
 
 Held whole, a merge grows with the inputs. Streamed, it grows with the largest
 tensor.
-
-## What it found
-
-Two things, which is what a benchmark is for.
-
-The first version reported the streaming apply holding 134% of the model, which
-read as a refuted claim and was a flaw in the measurement: the fixture was built
-in the process doing the measuring. Fixtures moved out, and the comparison
-against a whole build went in.
-
-The second was real. Writing a tensor went through `tobytes()`, which builds a
-copy of it before the write — a few megabytes per tensor, gigabytes over a whole
-model. It was enough to make the streaming apply *slower* than the version that
-holds everything: on the four-gigabyte model, 23.3 s against 10.7 s.
-
-Tensors are written straight from the array now, with the copy kept only for
-destinations that have no file descriptor to write to, such as an HTTP response
-body. The same apply takes 4.9 s: 4.8x faster than it was, and 2.2x faster than
-building the model in memory rather than 1.8x slower.
-
-That is the whole argument for measuring. The claim was true — streaming did
-hold two gigabytes less — and it was also costing twice the time, which nothing
-in the test suite could have shown.
