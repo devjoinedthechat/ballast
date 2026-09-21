@@ -6,12 +6,18 @@ on:
   pull_request:
 
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - run: uv pip install --system -e ".[dev]"
+      - run: ruff format --check .
+      - run: ruff check .
+      - run: mypy src
 
+  test:
+    runs-on: ubuntu-latest
     services:
       postgres:
         image: postgres:16-alpine
@@ -19,40 +25,40 @@ jobs:
           POSTGRES_USER: ballast
           POSTGRES_PASSWORD: ballast
           POSTGRES_DB: ballast
-        ports:
-          - 55432:5432
+        ports: ["55432:5432"]
         options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      BALLAST_TEST_POSTGRES: postgresql://ballast:ballast@localhost:55432/ballast
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.python }}
       - run: uv pip install --system -e ".[dev]"
-      - run: ruff check .
-      - run: ruff format --check .
-      - run: mypy src
-      - name: Tests, with Postgres
-        run: pytest -q
-        env:
-          BALLAST_TEST_POSTGRES: postgresql://ballast:ballast@localhost:55432/ballast
-      - name: The store runs without its optional dependencies
-        run: |
-          python -m venv /tmp/bare
-          /tmp/bare/bin/pip install -q -e .
-          /tmp/bare/bin/python -c "
-          import tempfile, numpy as np
-          from ballast import Store
-          s = Store(tempfile.mkdtemp())
-          c = s.commit('t', {'w': np.arange(64, dtype=np.float32)}, message='v1')
-          assert np.array_equal(s.checkout('t', c.id)['w'], np.arange(64, dtype=np.float32))
-          assert s.fsck('t') == []
-          print('core works without torch, boto3 or psycopg')
-          "
-      - run: python -c "import ballast.runners, ballast.serving"
+      - run: pytest -q
       - name: The benchmark runs
         run: python scripts/benchmark.py --size s
+
+  bare:
+    # The store's four dependencies are enough on their own: no torch, no
+    # boto3, no psycopg, no starlette.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - run: uv pip install --system -e .
+      - run: |
+          python -c "
+          import tempfile, numpy as np
+          from ballast import Store
+          store = Store(tempfile.mkdtemp())
+          commit = store.commit('t', {'w': np.arange(64, dtype=np.float32)}, message='v1')
+          assert np.array_equal(store.checkout('t', commit.id)['w'], np.arange(64, dtype=np.float32))
+          assert store.fsck('t') == []
+          print('the core works without any optional dependency')
+          "
