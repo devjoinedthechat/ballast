@@ -9,6 +9,29 @@ API is not yet stable.
 
 ### Added
 
+- **Fifteen merge methods resolve**, up from five: `slerp`, `nuslerp`,
+  `multislerp`, `breadcrumbs`, `breadcrumbs_ties`, `della`, `della_linear`,
+  `model_stock`, `sce` and `passthrough` joined the four that already did. Each
+  is compared against mergekit's own function numerically — the deterministic
+  sparsifiers to zero, the geometric and consensus methods to float32 epsilon,
+  and DELLA's keep probabilities to 1e-8.
+- **Every method is one per-tensor operation.** `merge_tensor` merges one named
+  tensor across the inputs, and the dictionary-level functions map over names.
+  That is what lets a view resolve without holding its inputs, and it makes a new
+  method one function rather than a new path through the store.
+- **Views resolve incrementally.** An uncached view is merged tensor by tensor —
+  one tensor per input rather than one model per input — and its cache is written
+  as it streams, to a temporary file renamed only once the last tensor is out. A
+  consumer that stops half way leaves nothing behind pretending to be a view.
+- **Writes over HTTP,** on a separate scope from reads: a fleet pulling adapters
+  should not hold a credential that can delete one. `POST .../commits` takes a
+  safetensors body, `POST .../merges` records a view, `DELETE .../commits/{spec}`
+  forgets one and returns its proof.
+- **`sync-vllm`,** which converges a running vLLM on what the store holds: loads
+  what is missing, unloads what is gone, leaves other tenants alone, and changes
+  nothing on a second run. Names carry the ref and the commit, so a ref moving is
+  visible as a different name.
+
 - **Five more merge methods that resolve**, taking the total to ten: `slerp`,
   `breadcrumbs`, `breadcrumbs_ties`, `della` and `della_linear`. Each is compared
   against mergekit's own function numerically — the two deterministic sparsifiers
@@ -53,6 +76,9 @@ API is not yet stable.
   unobserved-change threshold with a similarity score for probes that moved.
 
 ### Fixed
+
+- **`passthrough` was implemented but listed as record-only,** so a recipe that
+  ballast could resolve refused instead.
 
 - **`RESOLVABLE` and `RECORD_ONLY` overlapped,** so whether a recipe ran or
   refused depended on the order of checks inside `resolve`. A test now asserts

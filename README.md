@@ -16,7 +16,7 @@
 <p align="center">
   <a href="https://github.com/devjoinedthechat/ballast/actions/workflows/ci.yml"><img src="https://github.com/devjoinedthechat/ballast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%20%7C%203.12%20%7C%203.14-blue" alt="Python 3.10 | 3.12 | 3.14">
-  <img src="https://img.shields.io/badge/tests-197-brightgreen" alt="197 tests">
+  <img src="https://img.shields.io/badge/tests-243-brightgreen" alt="243 tests">
   <img src="https://img.shields.io/badge/verified%20against-mergekit%20%C2%B7%20PEFT%20%C2%B7%20Postgres-2e7d32" alt="Verified against mergekit, PEFT and Postgres">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0">
   <img src="https://img.shields.io/badge/status-pre--alpha-orange" alt="Status: pre-alpha">
@@ -94,10 +94,12 @@ reported as exactly that.
   every block and checks every reference whichever pair you run.
 - **Ready to serve.** `serve-export` materialises deltas into the layout a
   serving runtime loads, with a stable id per commit. `ballast serve` offers the
-  same over HTTP, so a fleet that does not share a filesystem can pull by commit
-  id — an immutable response, cacheable for ever.
-- **Ten merge methods that resolve**, each matching mergekit's own functions
-  numerically: linear, task arithmetic, TIES, DARE, SLERP, breadcrumbs and DELLA.
+  same over HTTP, reads and writes on separate scopes, so a fleet that does not
+  share a filesystem can pull by commit id — an immutable response, cacheable for
+  ever. `sync-vllm` converges a running vLLM on what the store holds.
+- **Fifteen merge methods that resolve**, each matching mergekit's own functions
+  numerically: linear, task arithmetic, TIES, DARE, SLERP, nuSLERP, multiSLERP,
+  breadcrumbs, DELLA, Model Stock, SCE and passthrough.
 - **Bounded memory.** Tensors are read block by block and written one at a time,
   so applying a delta to a 70B model costs one tensor, not a model.
 
@@ -172,16 +174,25 @@ deleted or a grant revoked.
 | resolves | what it does |
 | --- | --- |
 | `linear`, `task_arithmetic` | weighted sum |
+| `passthrough` | one input, scaled |
 | `ties` | trim to the largest, elect a sign, merge those that agree |
 | `slerp` | interpolate along the arc between two inputs, keeping their magnitude |
+| `nuslerp` | the same, weighted and per row rather than per tensor |
+| `multislerp` | barycentric interpolation on the sphere, for more than two |
 | `breadcrumbs`, `breadcrumbs_ties` | drop the largest as outliers as well as the smallest |
 | `dare_ties`, `dare_linear` | drop at random, rescale to the original norm |
 | `della`, `della_linear` | drop at random, but weighted by rank within each row |
+| `model_stock` | step toward the mean as far as the inputs' agreement allows |
+| `sce` | select by disagreement, weight by magnitude, erase by sign |
 
-`passthrough`, `model_stock`, `nuslerp`, `multislerp`, `sce` and `arcee_fusion`
-are recorded for provenance and refuse to resolve, rather than quietly running as
-something else. A test asserts the two lists never overlap, because an overlap
-would make the answer depend on the order of checks.
+`arcee_fusion`, `karcher` and `nearswap` are recorded for provenance and refuse to
+resolve, rather than quietly running as something else. A test asserts the two
+lists never overlap, because an overlap would make the answer depend on the order
+of checks.
+
+Every method is built from one per-tensor operation, `merge_tensor`. That is what
+lets a view be resolved without holding its inputs, and it means a new method is
+one function rather than a new path through the store.
 
 The DARE and DELLA methods draw a random mask, so a view records the seed it was
 created with and resolves the same way every time. mergekit draws from the global
@@ -292,11 +303,30 @@ $ curl -s localhost:8080/tenants/acme/loras | jq '.loras[0]'
   "commit": "a7b571bab537…", "url": "/tenants/acme/commits/a7b571bab537…/adapter" }
 ```
 
-Reads only, because writing is a control-plane job that wants more authentication
-than one token. A commit id names exactly one set of tensors, so every response is
-immutable and carries `cache-control: immutable` and an ETag — cheap to put behind
-anything. A bearer token is scoped to the tenants it may read, and a request for
-another tenant is a 404 rather than a 403, because a 403 confirms the tenant exists.
+Reading and writing are separate scopes on separate tokens, because they are
+separate jobs: a fleet pulling adapters should not hold a credential that can
+delete one. `POST /tenants/{t}/commits` takes a safetensors body, `POST
+/tenants/{t}/merges` records a view, and `DELETE /tenants/{t}/commits/{spec}`
+forgets one and returns the proof.
+
+A commit id names exactly one set of tensors, so every read is immutable and says
+so with `cache-control: immutable` and an ETag — cheap to put behind anything. A
+token that may not read a tenant gets a 404 rather than a 403, because a 403
+confirms the tenant exists; a token that may read but not write gets a 403, since
+it already knows.
+
+To drive a vLLM that is already up:
+
+```
+$ ballast --tenant acme sync-vllm --url http://vllm:8000 -o /srv/loras
+loaded     acme-support-a7b571ba
+unloaded   acme-support-3f10b2cc
+```
+
+A reconciliation rather than a push: it loads what is missing, unloads what the
+store no longer has, leaves the rest alone, and leaves other tenants' adapters
+untouched. Names carry the ref and the commit, so a ref moving is visible as a
+different name and converges. Running it twice changes nothing the second time.
 
 ## Storage
 
@@ -328,7 +358,8 @@ the wrong answer for several.
 | `diff <a> <b> [--probe-set] [--threshold]` | weight change and, if fingerprinted, probe change |
 | `fingerprint <spec> --probes <file>` | run a probe set through the model and record the answers |
 | `serve-export [<spec>…] -o <dir>` | materialise for a serving runtime, with stable ids |
-| `serve [--tokens f] [--port n]` | read-only HTTP API a runtime can pull from |
+| `serve [--tokens f] [--port n]` | HTTP API: pull adapters, and push with a write token |
+| `sync-vllm --url … -o <dir>` | converge a running vLLM on what the store holds |
 | `log` / `reflog` / `reset <ref> <spec>` | history, every ref move, rollback |
 | `grant <spec> --to <t>` / `revoke` / `grants` | cross-tenant sharing |
 | `forget [<spec>] --reason …` | delete a tenant or a commit, with a proof |
@@ -371,20 +402,15 @@ Not published to an index yet, so install from a checkout.
 
 What is not there:
 
-- **Writes over HTTP.** `ballast serve` reads. Committing, merging and forgetting
-  are control-plane operations that want authentication with more to say than one
-  bearer token, and they are deliberately not exposed.
-- **A live connection to a running vLLM.** A runtime can discover and pull
-  adapters, and `lora_request()` builds vLLM's own request object, but nothing
-  here tells a server that is already up to load one. vLLM is CUDA-first and is
-  not installed in CI, so that call is the one part of the hand-off the tests do
-  not reach.
-- **Six merge methods.** `passthrough`, `model_stock`, `nuslerp`, `multislerp`,
-  `sce`, `arcee_fusion` and the slice form are read and recorded, and refuse
-  rather than approximate.
-- **A view resolved incrementally.** Leaves stream and a cached view streams from
-  its file, but resolving a view for the first time holds its inputs, because a
-  merge needs all of them.
+- **A live vLLM in the tests.** `sync-vllm` drives vLLM's runtime LoRA endpoints
+  and is tested against a stub transport, which checks the conversation — the
+  requests made and how each reply is handled — but not vLLM's own behaviour.
+  vLLM is CUDA-first and is not installed in CI.
+- **Three merge methods.** `arcee_fusion`, `karcher` and `nearswap` are read and
+  recorded, and refuse rather than approximate. So does the `slices` form, which
+  composes layer ranges rather than whole deltas.
+- **Authentication beyond bearer tokens.** Scoped static tokens are enough for a
+  fleet behind a gateway and are not an identity system.
 - **A systems-language core.** `chunks.py` is one module with a narrow interface
   and nothing above it touches a backend directly, so it is the piece to rewrite
   when a single node stops being enough. There is no evidence it is the

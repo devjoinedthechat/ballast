@@ -30,7 +30,9 @@ from ballast import merge as merging
 from ballast.store import Commit, Store
 
 # Parameters this resolver acts on. Anything else is recorded, not interpreted.
-ACTED_ON = frozenset({"weight", "density", "normalize", "lambda", "gamma", "epsilon", "t"})
+ACTED_ON = frozenset(
+    {"weight", "density", "normalize", "lambda", "gamma", "epsilon", "t"} | set(merging.EXTRA_KEYS)
+)
 
 
 class SliceMerge(ValueError):
@@ -154,6 +156,7 @@ def import_config(
         gamma=_scalar(defaults["gamma"]) if "gamma" in defaults else None,
         epsilon=_scalar(defaults["epsilon"]) if "epsilon" in defaults else None,
         t=_scalar(defaults["t"]) if "t" in defaults and resolvable else None,
+        extra={k: defaults[k] for k in merging.EXTRA_KEYS if k in defaults} if resolvable else None,
         provenance=provenance,
     )
 

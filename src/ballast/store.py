@@ -437,6 +437,7 @@ class Store:
         gamma: float | None = None,
         epsilon: float | None = None,
         t: float | None = None,
+        extra: dict[str, Any] | None = None,
         provenance: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         parent: str | None = None,
@@ -493,6 +494,11 @@ class Store:
             config["t"] = float(t)
         elif method == "slerp":
             raise ValueError("slerp needs a t: how far to travel from the first input to the second")
+        if extra:
+            # Validated here rather than at checkout, so a view that names a
+            # parameter this resolver does not have is refused when it is made.
+            merging.params_for(extra=extra)
+            config.update(extra)
         if provenance:
             # Recorded, not interpreted: everything the recipe said that this
             # resolver does not act on, so the view still describes its origin.
@@ -806,6 +812,7 @@ class Store:
             manifest.config.get("gamma", merging.DEFAULT_GAMMA),
             manifest.config.get("epsilon", merging.DEFAULT_EPSILON),
             manifest.config.get("t"),
+            {k: v for k, v in manifest.config.items() if k in merging.EXTRA_KEYS},
         )
         if self.cache_views:
             cached.parent.mkdir(parents=True, exist_ok=True)
@@ -847,11 +854,11 @@ class Store:
     def checkout_stream(self, tenant: str, spec: str) -> Iterator[tuple[str, np.ndarray]]:
         """A commit's tensors, one at a time, in name order.
 
-        A leaf is read block by block, and a view that is already cached is read
-        from its file, so in both cases nothing larger than one tensor is held.
-        A view that is not cached has to resolve all of its inputs before it can
-        produce anything — that is what a merge is — so it is resolved once and
-        then yielded.
+        A leaf is read block by block. A cached view is read from its file. An
+        uncached view is merged tensor by tensor: for each name, that one tensor
+        is fetched from each input and merged, so what is held is one tensor per
+        input rather than one model per input. A stack three deep over eight-
+        gigabyte deltas costs megabytes.
         """
         commit = self.resolve(tenant, spec)
         manifest = self.manifest(tenant, commit.manifest_id)
@@ -859,13 +866,147 @@ class Store:
             yield from self._stream_leaf(tenant, manifest.id)
             return
         cached = self._cache_path(tenant, manifest.id)
-        if self.cache_views and not cached.exists():
-            self._materialise(tenant, manifest.id, viewer=tenant)
         if self.cache_views and cached.exists():
             tensors, _ = st.load(cached)
             yield from sorted(tensors.items())
             return
-        yield from sorted(self._materialise(tenant, manifest.id, viewer=tenant).items())
+        yield from self._stream_composite(tenant, manifest.id, viewer=tenant, cache=self.cache_views)
+
+    def _stream_composite(
+        self, tenant: str, manifest_id: str, viewer: str, cache: bool = False
+    ) -> Iterator[tuple[str, np.ndarray]]:
+        """Merge a view tensor by tensor, optionally filling its cache as it goes.
+
+        The cache is written to a temporary file and renamed only once the last
+        tensor is out, so a consumer that stops half way leaves no partial file
+        behind pretending to be a resolved view.
+        """
+        manifest = self.manifest(tenant, manifest_id)
+        merging.check(manifest.config["method"])
+        parts = self.inputs(tenant, manifest_id)
+        weights = [w for _, _, w in parts]
+        params = merging.params_for(
+            manifest.config.get("density"),
+            manifest.config.get("normalize"),
+            manifest.config.get("lambda", 1.0),
+            manifest.config.get("gamma", merging.DEFAULT_GAMMA),
+            manifest.config.get("epsilon", merging.DEFAULT_EPSILON),
+            manifest.config.get("seed"),
+            manifest.config.get("t"),
+            {k: v for k, v in manifest.config.items() if k in merging.EXTRA_KEYS},
+        )
+        strict = manifest.config.get("strict", True)
+
+        try:
+            per_input = [self._specs_of(owner, mid, viewer) for owner, mid, _ in parts]
+        except BrokenView as exc:
+            raise BrokenView(f"composite {manifest_id[:12]} cannot resolve: {exc}") from exc
+        names = self._merge_names(per_input, strict)
+
+        def produce(name: str) -> np.ndarray:
+            arrays = [
+                self._tensor_of(owner, mid, name, viewer) if name in specs else None
+                for (owner, mid, _), specs in zip(parts, per_input, strict=True)
+            ]
+            try:
+                return merging.merge_tensor(manifest.config["method"], name, arrays, weights, params)
+            except BrokenView as exc:
+                raise BrokenView(f"composite {manifest_id[:12]} cannot resolve: {exc}") from exc
+
+        if not cache:
+            for name in names:
+                yield name, produce(name)
+            return
+
+        target = self._cache_path(tenant, manifest_id)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+        specs = self._merged_specs(per_input, names)
+        try:
+            with tmp.open("wb") as handle:
+                yield from st.stream_writer(handle, specs, produce)
+            tmp.replace(target)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _merged_specs(
+        per_input: Sequence[dict[str, tuple[str, tuple[int, ...]]]], names: Sequence[str]
+    ) -> dict[str, tuple[str, tuple[int, ...]]]:
+        merged: dict[str, tuple[str, tuple[int, ...]]] = {}
+        for name in names:
+            for specs in per_input:
+                if name in specs:
+                    merged[name] = specs[name]
+                    break
+        return merged
+
+    @staticmethod
+    def _merge_names(per_input: Sequence[dict[str, Any]], strict: bool) -> list[str]:
+        names = set(per_input[0])
+        for specs in per_input[1:]:
+            if strict and set(specs) != names:
+                missing = sorted(names.symmetric_difference(specs))
+                raise ValueError(
+                    f"inputs do not share the same tensors; differ on {missing[:5]} "
+                    f"(record the view with strict=False to union)"
+                )
+            names |= set(specs)
+        return sorted(names)
+
+    def _specs_of(self, tenant: str, manifest_id: str, viewer: str) -> dict[str, tuple[str, tuple[int, ...]]]:
+        """A manifest's tensor names, dtypes and shapes, without reading any tensor."""
+        self._check_grant(tenant, manifest_id, viewer)
+        manifest = self.manifest(tenant, manifest_id)
+        if manifest.kind == "leaf":
+            rows = self.db.execute(
+                "SELECT name, dtype, shape FROM manifest_tensors WHERE tenant = ? AND manifest_id = ? "
+                "ORDER BY name",
+                (tenant, manifest_id),
+            ).fetchall()
+            return {r["name"]: (r["dtype"], tuple(json.loads(r["shape"]))) for r in rows}
+        parts = self.inputs(tenant, manifest_id)
+        try:
+            per_input = [self._specs_of(owner, mid, tenant) for owner, mid, _ in parts]
+        except BrokenView as exc:
+            raise BrokenView(f"composite {manifest_id[:12]} cannot resolve: {exc}") from exc
+        names = self._merge_names(per_input, manifest.config.get("strict", True))
+        return self._merged_specs(per_input, names)
+
+    def _tensor_of(self, tenant: str, manifest_id: str, name: str, viewer: str) -> np.ndarray:
+        """One tensor from a manifest, resolving views for that tensor alone."""
+        self._check_grant(tenant, manifest_id, viewer)
+        manifest = self.manifest(tenant, manifest_id)
+        if manifest.kind == "leaf":
+            return self._read_tensor(tenant, manifest_id, name)
+        for found, array in self._stream_composite(tenant, manifest_id, viewer=tenant):
+            if found == name:
+                return array
+        raise KeyError(f"{name!r} is not in {tenant}:{manifest_id[:12]}")
+
+    def _read_tensor(self, tenant: str, manifest_id: str, name: str) -> np.ndarray:
+        row = self.db.execute(
+            "SELECT dtype, shape FROM manifest_tensors WHERE tenant = ? AND manifest_id = ? AND name = ?",
+            (tenant, manifest_id, name),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"{name!r} is not in {tenant}:{manifest_id[:12]}")
+        blocks = self.db.execute(
+            "SELECT b.chunk_hash, c.encoding, c.nbytes FROM tensor_blocks b "
+            "JOIN chunks c ON c.tenant = b.tenant AND c.hash = b.chunk_hash "
+            "WHERE b.tenant = ? AND b.manifest_id = ? AND b.name = ? ORDER BY b.position",
+            (tenant, manifest_id, name),
+        ).fetchall()
+        return self.chunks.get_tensor(
+            tenant,
+            row["dtype"],
+            json.loads(row["shape"]),
+            [(b["chunk_hash"], b["encoding"], b["nbytes"]) for b in blocks],
+        )
+
+    def _check_grant(self, tenant: str, manifest_id: str, viewer: str) -> None:
+        if tenant != viewer and not self._granted(tenant, manifest_id, viewer):
+            raise BrokenView(f"grant on {tenant}:{manifest_id[:12]} for {viewer!r} is missing or revoked")
 
     def _stream_leaf(self, tenant: str, manifest_id: str) -> Iterator[tuple[str, np.ndarray]]:
         rows = self.db.execute(
@@ -898,14 +1039,7 @@ class Store:
         """
         commit = self.resolve(tenant, spec)
         manifest = self.manifest(tenant, commit.manifest_id)
-        if manifest.kind == "leaf":
-            rows = self.db.execute(
-                "SELECT name, dtype, shape FROM manifest_tensors WHERE tenant = ? AND manifest_id = ? "
-                "ORDER BY name",
-                (tenant, manifest.id),
-            ).fetchall()
-            return {r["name"]: (r["dtype"], tuple(json.loads(r["shape"]))) for r in rows}
-        return st.specs_of(self._materialise(tenant, manifest.id, viewer=tenant))
+        return self._specs_of(tenant, manifest.id, viewer=tenant)
 
     def stats(self, tenant: str) -> Stats:
         names.tenant(tenant)

@@ -17,7 +17,7 @@ import itertools
 import json
 import math
 import struct
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -176,33 +176,14 @@ def save_stream(
     `target` is a path or an open binary file, so the same code writes a shard
     to disk and an adapter to a response body.
     """
-    header: dict[str, Any] = {}
-    offset = 0
-    ordered = sorted(specs)
-    for name in ordered:
-        dtype, shape = specs[name]
-        if dtype not in DTYPES:
-            raise ValueError(f"{name!r} has unknown dtype {dtype!r}")
-        nbytes = math.prod(shape) * DTYPES[dtype].itemsize
-        header[name] = {"dtype": dtype, "shape": list(shape), "data_offsets": [offset, offset + nbytes]}
-        offset += nbytes
-    if metadata:
-        header["__metadata__"] = metadata
-
-    encoded = json.dumps(header, separators=(",", ":")).encode()
-    encoded += b" " * (-len(encoded) % 8)
+    _, encoded = _header(specs, metadata)
 
     def write(f: BinaryIO) -> None:
         f.write(struct.pack("<Q", len(encoded)))
         f.write(encoded)
-        for name in ordered:
-            dtype, shape = specs[name]
+        for name in sorted(specs):
             array = np.ascontiguousarray(produce(name))
-            if dtype_name(array.dtype) != dtype or tuple(array.shape) != tuple(shape):
-                raise ValueError(
-                    f"{name!r} was declared {dtype} {list(shape)} but produced "
-                    f"{dtype_name(array.dtype)} {list(array.shape)}"
-                )
+            _check(name, array, specs[name])
             f.write(array.view(np.uint8).reshape(-1).tobytes())
             del array
 
@@ -213,8 +194,58 @@ def save_stream(
         write(target)
 
 
+def stream_writer(
+    handle: BinaryIO,
+    specs: Mapping[str, tuple[str, Sequence[int]]],
+    produce: Callable[[str], np.ndarray],
+) -> Iterator[tuple[str, np.ndarray]]:
+    """Write a file one tensor at a time, yielding each as it lands.
+
+    `save_stream` pushes; this pulls. A caller that is itself producing tensors
+    for someone else can write the file and hand each tensor on in the same
+    pass, rather than building the whole thing twice.
+    """
+    header, encoded = _header(specs)
+    handle.write(struct.pack("<Q", len(encoded)))
+    handle.write(encoded)
+    for name in sorted(specs):
+        array = np.ascontiguousarray(produce(name))
+        _check(name, array, specs[name])
+        handle.write(array.view(np.uint8).reshape(-1).tobytes())
+        yield name, array
+    del header
+
+
 def specs_of(tensors: dict[str, np.ndarray]) -> dict[str, tuple[str, tuple[int, ...]]]:
     return {name: (dtype_name(a.dtype), tuple(a.shape)) for name, a in tensors.items()}
+
+
+def _header(
+    specs: Mapping[str, tuple[str, Sequence[int]]], metadata: dict[str, str] | None = None
+) -> tuple[dict[str, Any], bytes]:
+    header: dict[str, Any] = {}
+    offset = 0
+    for name in sorted(specs):
+        dtype, shape = specs[name]
+        if dtype not in DTYPES:
+            raise ValueError(f"{name!r} has unknown dtype {dtype!r}")
+        nbytes = math.prod(shape) * DTYPES[dtype].itemsize
+        header[name] = {"dtype": dtype, "shape": list(shape), "data_offsets": [offset, offset + nbytes]}
+        offset += nbytes
+    if metadata:
+        header["__metadata__"] = metadata
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    return header, encoded
+
+
+def _check(name: str, array: np.ndarray, spec: tuple[str, Sequence[int]]) -> None:
+    dtype, shape = spec
+    if dtype_name(array.dtype) != dtype or tuple(array.shape) != tuple(shape):
+        raise ValueError(
+            f"{name!r} was declared {dtype} {list(shape)} but produced "
+            f"{dtype_name(array.dtype)} {list(array.shape)}"
+        )
 
 
 def load_dir(directory: Path | str) -> dict[str, np.ndarray]:

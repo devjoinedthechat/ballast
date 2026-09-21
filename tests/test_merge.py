@@ -35,7 +35,7 @@ def test_mismatched_tensor_sets_are_refused():
         merging.linear([{"w": np.zeros(2)}, {"v": np.zeros(2)}], [1, 1])
 
 
-@pytest.mark.parametrize("method", ["passthrough", "model_stock", "nuslerp", "sce"])
+@pytest.mark.parametrize("method", ["arcee_fusion", "karcher", "nearswap"])
 def test_record_only_methods_refuse_to_resolve(method):
     """A method that is not implemented must not quietly run as one that is."""
     with pytest.raises(NotImplementedError, match="recorded for provenance"):
@@ -283,3 +283,133 @@ def test_a_method_is_either_resolvable_or_recorded_never_both():
     """
     assert not set(merging.RESOLVABLE) & set(merging.RECORD_ONLY)
     assert set(merging.SEEDED) <= set(merging.RESOLVABLE)
+
+
+# -- the geometric and consensus methods -----------------------------------
+
+A = np.array([3.0, 4.0, 0.0], dtype=np.float32)
+B = np.array([0.0, 4.0, 3.0], dtype=np.float32)
+C = np.array([4.0, 0.0, 3.0], dtype=np.float32)
+
+
+def test_nuslerp_keeps_magnitude_like_slerp_does():
+    out = merging.merge_tensor("nuslerp", "w", [A, B], [1.0, 1.0], merging.Params())
+    assert float(np.linalg.norm(out)) == pytest.approx(5.0, rel=1e-5)
+
+
+def test_nuslerp_weights_decide_how_far_it_travels():
+    """Unlike slerp it takes weights, and only their ratio matters."""
+    near_a = merging.merge_tensor("nuslerp", "w", [A, B], [9.0, 1.0], merging.Params())
+    near_b = merging.merge_tensor("nuslerp", "w", [A, B], [1.0, 9.0], merging.Params())
+    assert np.linalg.norm(near_a - A) < np.linalg.norm(near_a - B)
+    assert np.linalg.norm(near_b - B) < np.linalg.norm(near_b - A)
+    scaled = merging.merge_tensor("nuslerp", "w", [A, B], [90.0, 10.0], merging.Params())
+    assert np.allclose(near_a, scaled, atol=1e-5)
+
+
+def test_weights_that_cancel_land_halfway_rather_than_exploding():
+    out = merging.merge_tensor("nuslerp", "w", [A, B], [1.0, -1.0], merging.Params())
+    halfway = merging.merge_tensor("nuslerp", "w", [A, B], [1.0, 1.0], merging.Params())
+    assert np.allclose(out, halfway)
+
+
+def test_nuslerp_row_wise_interpolates_each_row_separately():
+    a = np.array([[3.0, 4.0], [1.0, 0.0]], dtype=np.float32)
+    b = np.array([[4.0, 3.0], [0.0, 1.0]], dtype=np.float32)
+    flat = merging.merge_tensor("nuslerp", "w", [a, b], [1.0, 1.0], merging.Params(flatten=True))
+    rows = merging.merge_tensor("nuslerp", "w", [a, b], [1.0, 1.0], merging.Params(row_wise=True))
+    assert flat.shape == rows.shape == a.shape
+    assert not np.allclose(flat, rows)
+
+
+def test_multislerp_interpolates_three_inputs_on_the_sphere():
+    out = merging.merge_tensor("multislerp", "w", [A, B, C], [1.0, 1.0, 1.0], merging.Params())
+    assert float(np.linalg.norm(out)) == pytest.approx(5.0, rel=1e-4)
+
+
+def test_multislerp_of_one_input_is_that_input():
+    assert np.allclose(merging.merge_tensor("multislerp", "w", [A], [1.0], merging.Params()), A)
+
+
+def test_antipodal_inputs_fall_back_to_a_line_rather_than_failing():
+    out = merging.merge_tensor("multislerp", "w", [A, -A], [1.0, 1.0], merging.Params())
+    assert np.allclose(out, 0.0, atol=1e-5)
+
+
+def test_three_inputs_that_cancel_are_refused_with_a_reason():
+    equilateral = [
+        np.array([1.0, 0.0], dtype=np.float32),
+        np.array([-0.5, 0.8660254], dtype=np.float32),
+        np.array([-0.5, -0.8660254], dtype=np.float32),
+    ]
+    with pytest.raises(ValueError, match="no mean direction"):
+        merging.merge_tensor("multislerp", "w", equilateral, [1.0, 1.0, 1.0], merging.Params())
+
+
+def test_model_stock_moves_further_when_the_inputs_agree():
+    """The whole idea: agreement licenses a longer step from the base."""
+    agreeing = [A, A * 1.01]
+    disagreeing = [A, np.array([-3.0, 4.0, 0.0], dtype=np.float32)]
+    close = merging.merge_tensor("model_stock", "w", agreeing, [1.0, 1.0], merging.Params())
+    far = merging.merge_tensor("model_stock", "w", disagreeing, [1.0, 1.0], merging.Params())
+    assert np.linalg.norm(close) > np.linalg.norm(far)
+
+
+def test_model_stock_needs_more_than_one_input():
+    with pytest.raises(ValueError, match="at least two"):
+        merging.merge_tensor("model_stock", "w", [A], [1.0], merging.Params())
+
+
+def test_sce_erases_entries_the_inputs_disagree_about():
+    a = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    b = np.array([1.0, -1.0, 1.0], dtype=np.float32)
+    out = merging.merge_tensor("sce", "w", [a, b], [1.0, 1.0], merging.Params())
+    # Entry 1 has no majority, so the losing side is erased and the winner stands.
+    assert out[0] == pytest.approx(1.0)
+    assert out[2] == pytest.approx(1.0)
+    assert abs(out[1]) == pytest.approx(1.0)
+
+
+def test_sce_select_topk_keeps_the_entries_with_the_most_disagreement():
+    a = np.array([1.0, 2.0, 5.0, 9.0], dtype=np.float32)
+    b = np.array([1.1, 1.0, -5.0, -9.0], dtype=np.float32)
+    out = merging.merge_tensor("sce", "w", [a, b], [1.0, 1.0], merging.Params(select_topk=0.5))
+    # Variance is largest at the last two entries, so those survive selection.
+    assert out[0] == pytest.approx(0.0)
+    assert out[1] == pytest.approx(0.0)
+    assert abs(out[2]) > 0
+    assert abs(out[3]) > 0
+
+
+def test_sce_selection_rounds_down_and_can_select_nothing():
+    """Inherited from mergekit, and surprising enough to pin.
+
+    `k` is the share of entries that vary at all, rounded down, so a tensor
+    where only one entry differs selects none of them and merges to zero.
+    """
+    a = np.array([1.0, 1.0, 5.0, 1.0], dtype=np.float32)
+    b = np.array([1.0, 1.0, -5.0, 1.0], dtype=np.float32)
+    out = merging.merge_tensor("sce", "w", [a, b], [1.0, 1.0], merging.Params(select_topk=0.25))
+    assert np.allclose(out, 0.0)
+
+
+def test_passthrough_carries_one_input_through(store, rng):
+    c = store.commit("t", adapter(rng), message="a", base_model="b")
+    m = store.merge("t", "passthrough", [(c.id, 1.0)], message="p")
+    assert store.checkout("t", m.id)
+    with pytest.raises(ValueError, match="exactly one input"):
+        merging.merge_tensor("passthrough", "w", [A, B], [1.0, 1.0], merging.Params())
+
+
+def test_a_view_stores_the_parameters_only_its_method_uses(store, rng):
+    c1 = store.commit("t", adapter(rng), message="a", base_model="b")
+    c2 = store.commit("t", adapter(rng), message="b", base_model="b")
+    m = store.merge("t", "nuslerp", [(c1.id, 0.7), (c2.id, 0.3)], message="nu", extra={"row_wise": True})
+    assert store.manifest("t", m.manifest_id).config["row_wise"] is True
+    assert store.checkout("t", m.id)
+
+
+def test_a_parameter_no_method_has_is_refused_when_the_view_is_made(store, rng):
+    c = store.commit("t", adapter(rng), message="a", base_model="b")
+    with pytest.raises(ValueError, match="unknown merge parameters"):
+        store.merge("t", "linear", [(c.id, 1.0)], message="x", extra={"invented": 1})

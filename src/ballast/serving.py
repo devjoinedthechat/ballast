@@ -18,6 +18,7 @@ vLLM installed, and it is not exercised in CI.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -109,6 +110,103 @@ def export(
         base_model=manifest.base_model,
         reused=reused,
     )
+
+
+class VLLMRuntime:
+    """Tell a running vLLM server which adapters to hold.
+
+    vLLM's OpenAI server can load and unload LoRAs while it is up, when it is
+    started with `VLLM_ALLOW_RUNTIME_LORA_UPDATING=1`. This drives those
+    endpoints from a store, so a fleet converges on what the store says rather
+    than on whatever it was started with.
+
+    `sync` is a reconciliation, not a push: it loads what is missing, unloads
+    what the store no longer has, and leaves the rest alone. Running it twice
+    changes nothing the second time, which is what makes it safe to run on a
+    timer.
+
+    Tested against a stub transport rather than a live server. vLLM is
+    CUDA-first and is not installed in CI, so what is checked is the requests
+    this makes and how it reacts to the replies, not vLLM's behaviour.
+    """
+
+    def __init__(self, base_url: str, client: Any = None, timeout: float = 30.0) -> None:
+        if client is None:
+            import httpx  # noqa: PLC0415
+
+            client = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
+        self.base_url = base_url.rstrip("/")
+        self.client = client
+
+    def loaded(self) -> set[str]:
+        """The model names the server currently serves, adapters included."""
+        response = self.client.get("/v1/models")
+        response.raise_for_status()
+        return {entry["id"] for entry in response.json().get("data", [])}
+
+    def load(self, item: LoRAExport) -> bool:
+        """Ask the server to hold this adapter. False if it already did."""
+        response = self.client.post(
+            "/v1/load_lora_adapter",
+            json={"lora_name": item.name, "lora_path": str(item.path), "lora_int_id": item.int_id},
+        )
+        if response.status_code == 400 and "already" in response.text.lower():
+            return False
+        response.raise_for_status()
+        return True
+
+    def unload(self, name: str) -> None:
+        response = self.client.post("/v1/unload_lora_adapter", json={"lora_name": name})
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
+
+    def sync(
+        self,
+        store: Store,
+        tenant: str,
+        root: Path | str,
+        specs: Sequence[str] | None = None,
+        prune: bool = True,
+    ) -> dict[str, list[str]]:
+        """Converge the server on what the store holds for this tenant.
+
+        Returns what changed, so a caller running this on a timer can log the
+        turns where something did and stay quiet otherwise.
+        """
+        from ballast.store import BrokenView  # noqa: PLC0415
+
+        wanted: dict[str, LoRAExport] = {}
+        skipped: list[str] = []
+        for spec in specs or sorted(store.refs(tenant)):
+            try:
+                # Named for the ref and the commit it points at: the ref makes
+                # the name readable, the commit makes it change when the content
+                # does, which is what lets a reconciliation notice.
+                commit = store.resolve(tenant, spec)
+                item = export(store, tenant, spec, root, name=f"{tenant}-{spec}-{commit.id[:8]}")
+            except BrokenView:
+                skipped.append(spec)
+                continue
+            wanted[item.name] = item
+
+        present = self.loaded()
+        # Only names this tenant owns are candidates for unloading: the server
+        # may be serving other tenants, and its base model is in this list too.
+        ours = {name for name in present if name.startswith(f"{tenant}-")}
+
+        loaded = [name for name, item in sorted(wanted.items()) if name not in present and self.load(item)]
+        unloaded: list[str] = []
+        if prune:
+            for name in sorted(ours - set(wanted)):
+                self.unload(name)
+                unloaded.append(name)
+        return {
+            "loaded": loaded,
+            "unloaded": unloaded,
+            "unchanged": sorted(set(wanted) & present),
+            "skipped": skipped,
+        }
 
 
 def lora_request(item: LoRAExport) -> Any:

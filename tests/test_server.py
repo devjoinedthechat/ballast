@@ -181,3 +181,196 @@ def test_the_same_delta_served_twice_is_byte_identical(client, rng):
     first = http.get("/tenants/acme/commits/support/adapter").content
     second = http.get("/tenants/acme/commits/support/adapter").content
     assert first == second
+
+
+# -- writes ----------------------------------------------------------------
+
+
+def adapter_bytes(rng):
+    import io
+
+    tensors = adapter(rng)
+    buffer = io.BytesIO()
+    st.save_stream(buffer, st.specs_of(tensors), tensors.__getitem__, {"format": "pt"})
+    return buffer.getvalue(), tensors
+
+
+@pytest.fixture
+def writable(store, rng):
+    from starlette.testclient import TestClient
+
+    tokens = Tokens({"ro": ["acme"], "rw": {"write": ["acme"]}, "other": {"write": ["elsewhere"]}})
+    return TestClient(create_app(store, tokens)), store
+
+
+RO = {"authorization": "Bearer ro"}
+RW = {"authorization": "Bearer rw"}
+
+
+def test_posting_an_adapter_commits_it(writable, rng):
+    http, store = writable
+    body, tensors = adapter_bytes(rng)
+    response = http.post(
+        "/tenants/acme/commits?message=run+41&ref=support&base_model=org/base",
+        content=body,
+        headers=RW,
+    )
+    assert response.status_code == 201
+    assert response.json()["tensors"] == len(tensors)
+
+    stored = store.checkout("acme", "support")
+    for name, array in tensors.items():
+        assert np.array_equal(stored[name].view(np.uint8), array.view(np.uint8))
+    assert store.manifest("acme", store.resolve("acme", "support").manifest_id).base_model == "org/base"
+
+
+def test_config_and_metadata_travel_as_json_parameters(writable, rng):
+    http, store = writable
+    body, _ = adapter_bytes(rng)
+    http.post(
+        "/tenants/acme/commits?message=v1&config=%7B%22r%22%3A+8%7D&metadata=%7B%22run%22%3A+41%7D",
+        content=body,
+        headers=RW,
+    )
+    commit = store.resolve("acme", "main")
+    assert commit.metadata == {"run": 41}
+    assert store.manifest("acme", commit.manifest_id).config == {"r": 8}
+
+
+def test_a_read_token_may_not_write_and_is_told_so(writable, rng):
+    """403, not 404: this token already knows the tenant exists."""
+    http, _ = writable
+    body, _ = adapter_bytes(rng)
+    response = http.post("/tenants/acme/commits?message=v1", content=body, headers=RO)
+    assert response.status_code == 403
+    assert "not write" in response.json()["error"]
+
+
+def test_a_token_for_another_tenant_sees_nothing(writable, rng):
+    http, _ = writable
+    body, _ = adapter_bytes(rng)
+    theirs = {"authorization": "Bearer other"}
+    assert http.post("/tenants/acme/commits?message=v1", content=body, headers=theirs).status_code == 404
+
+
+def test_writing_always_needs_a_token_even_on_an_open_server(store, rng):
+    from starlette.testclient import TestClient
+
+    http = TestClient(create_app(store))  # no tokens at all
+    body, _ = adapter_bytes(rng)
+    assert http.get("/health").status_code == 200
+    assert http.post("/tenants/acme/commits?message=v1", content=body).status_code == 403
+
+
+def test_a_commit_without_a_message_or_a_body_is_refused(writable, rng):
+    http, _ = writable
+    body, _ = adapter_bytes(rng)
+    assert http.post("/tenants/acme/commits", content=body, headers=RW).status_code == 400
+    assert http.post("/tenants/acme/commits?message=v1", content=b"", headers=RW).status_code == 400
+
+
+def test_a_body_that_is_not_safetensors_is_a_bad_request_not_a_crash(writable):
+    http, _ = writable
+    response = http.post("/tenants/acme/commits?message=v1", content=b"not a tensor file", headers=RW)
+    assert response.status_code == 400
+    assert "error" in response.json()
+
+
+def test_malformed_json_parameters_are_refused(writable, rng):
+    http, _ = writable
+    body, _ = adapter_bytes(rng)
+    response = http.post("/tenants/acme/commits?message=v1&config=nonsense", content=body, headers=RW)
+    assert response.status_code == 400
+    assert "config" in response.json()["error"]
+
+
+def test_recording_a_merge_over_http(writable, rng):
+    http, store = writable
+    body, _ = adapter_bytes(rng)
+    for ref in ("a", "b"):
+        http.post(
+            f"/tenants/acme/commits?message={ref}&ref={ref}&base_model=org/base", content=body, headers=RW
+        )
+
+    response = http.post(
+        "/tenants/acme/merges",
+        json={
+            "method": "ties",
+            "message": "blend",
+            "ref": "blend",
+            "density": 0.5,
+            "inputs": [{"spec": "a", "weight": 0.6}, {"spec": "b", "weight": 0.4}],
+        },
+        headers=RW,
+    )
+    assert response.status_code == 201
+    manifest = store.manifest("acme", store.resolve("acme", "blend").manifest_id)
+    assert manifest.kind == "composite"
+    assert manifest.config["density"] == 0.5
+    assert http.get("/tenants/acme/commits/blend/adapter", headers=RO).status_code == 200
+
+
+def test_a_merge_over_an_unknown_input_is_a_404(writable, rng):
+    http, _ = writable
+    response = http.post(
+        "/tenants/acme/merges",
+        json={"message": "x", "inputs": [{"spec": "nope"}]},
+        headers=RW,
+    )
+    assert response.status_code == 404
+
+
+def test_a_merge_with_no_inputs_or_a_bad_method_is_a_400(writable, rng):
+    http, _ = writable
+    body, _ = adapter_bytes(rng)
+    http.post("/tenants/acme/commits?message=a&ref=a", content=body, headers=RW)
+    assert (
+        http.post("/tenants/acme/merges", json={"message": "x", "inputs": []}, headers=RW).status_code == 400
+    )
+    bad = http.post(
+        "/tenants/acme/merges",
+        json={"method": "invented", "message": "x", "inputs": [{"spec": "a"}]},
+        headers=RW,
+    )
+    assert bad.status_code == 400
+
+
+def test_deleting_a_commit_returns_a_verified_proof(writable, rng):
+    http, store = writable
+    body, _ = adapter_bytes(rng)
+    http.post("/tenants/acme/commits?message=a&ref=a", content=body, headers=RW)
+    commit = store.resolve("acme", "a")
+
+    response = http.delete("/tenants/acme/commits/a?reason=withdrawn", headers=RW)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["verified"] is True
+    assert body["commits"] == [commit.id]
+    assert store.verify(body["attestation"]) == []
+
+
+def test_deleting_without_a_reason_is_refused(writable, rng):
+    http, _ = writable
+    body, _ = adapter_bytes(rng)
+    http.post("/tenants/acme/commits?message=a&ref=a", content=body, headers=RW)
+    response = http.delete("/tenants/acme/commits/a", headers=RW)
+    assert response.status_code == 400
+    assert "reason" in response.json()["error"]
+
+
+def test_a_read_token_cannot_delete(writable, rng):
+    http, _ = writable
+    body, _ = adapter_bytes(rng)
+    http.post("/tenants/acme/commits?message=a&ref=a", content=body, headers=RW)
+    assert http.delete("/tenants/acme/commits/a?reason=x", headers=RO).status_code == 403
+
+
+def test_write_implies_read(writable):
+    """A token that can replace a delta can already learn it."""
+    http, _ = writable
+    assert http.get("/tenants/acme/refs", headers=RW).status_code == 200
+
+
+def test_unknown_scopes_in_a_token_file_are_refused():
+    with pytest.raises(ValueError, match="unknown scopes"):
+        Tokens({"t": {"read": ["a"], "admin": ["b"]}})

@@ -387,6 +387,46 @@ def check_sparsifiers() -> bool:
         scaled = masked * (np.abs(value).sum() / np.abs(masked).sum())
         print(f"l1 rescale restores the norm: {np.isclose(np.abs(scaled).sum(), np.abs(value).sum())}")
 
+    # The geometric and consensus methods, compared whole.
+    from mergekit.merge_methods.multislerp import multislerp as mk_multislerp
+    from mergekit.merge_methods.nuslerp import nuslerp as mk_nuslerp
+    from mergekit.merge_methods.sce import sce_merge
+
+    geometric = {}
+    for shape in ((512,), (64, 32)):
+        a = rng.standard_normal(shape).astype(np.float32)
+        b = rng.standard_normal(shape).astype(np.float32)
+        for t in (0.25, 0.5, 0.75):
+            theirs = mk_nuslerp(
+                t, _torch.from_numpy(a.copy()), _torch.from_numpy(b.copy()), dim=-1, flatten=False
+            ).numpy()
+            mine = merging._nuslerp(t, a, b, row_wise=False, flatten=False)
+            geometric["nuslerp"] = max(geometric.get("nuslerp", 0.0), float(np.abs(theirs - mine).max()))
+
+    for n in (2, 3, 4):
+        vs = [rng.standard_normal(256).astype(np.float32) for _ in range(n)]
+        ws = [float(x) for x in rng.random(n) + 0.5]
+        theirs = mk_multislerp([_torch.from_numpy(v.copy()) for v in vs], ws).numpy()
+        mine = merging._multislerp(vs, ws, True)
+        geometric["multislerp"] = max(geometric.get("multislerp", 0.0), float(np.abs(theirs - mine).max()))
+
+    # SCE takes full tensors and a base; ballast is given deltas, so the base is zero.
+    for topk in (1.0, 0.5):
+        base = np.zeros((32, 16), dtype=np.float32)
+        vs = [rng.standard_normal((32, 16)).astype(np.float32) for _ in range(3)]
+        theirs = sce_merge(
+            [_torch.from_numpy(v.copy()) for v in vs],
+            _torch.from_numpy(base.copy()),
+            select_topk=topk,
+        ).numpy()
+        geometric[f"sce topk={topk}"] = float(np.abs(theirs - merging._sce(vs, topk)).max())
+
+    for label, difference in geometric.items():
+        print(f"{label}: max abs difference {difference:.2e}")
+        if difference > 1e-5:
+            print(f"FAIL: {label} differs from mergekit")
+            ok = False
+
     if ok:
         print("PASS: every deterministic piece matches mergekit")
     return ok

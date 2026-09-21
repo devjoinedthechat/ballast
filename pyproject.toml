@@ -29,6 +29,7 @@ peft = ["torch>=2.2", "transformers>=4.40", "peft>=0.11"]
 s3 = ["boto3>=1.34"]
 postgres = ["psycopg[binary]>=3.1"]
 serve = ["starlette>=0.37", "uvicorn>=0.30"]
+vllm-sync = ["httpx>=0.27"]
 verify = ["torch>=2.2", "transformers>=4.40", "peft>=0.11", "mergekit>=0.1"]
 dev = [
     "pytest>=8", "ruff>=0.6", "mypy>=1.11", "types-PyYAML>=6", "hypothesis>=6",

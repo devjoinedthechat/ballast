@@ -112,6 +112,14 @@ def cmd_checkout(store: Store, a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync_vllm(store: Store, a: argparse.Namespace) -> int:
+    runtime = serving.VLLMRuntime(a.url)
+    changed = runtime.sync(store, a.tenant, a.out, specs=a.specs or None, prune=not a.no_prune)
+    lines = [f"{action:<10} {name}" for action, names in changed.items() for name in names]
+    _emit(a, "\n".join(lines) or "nothing to change", changed)
+    return 0 if not changed["skipped"] else 4
+
+
 def cmd_serve(store: Store, a: argparse.Namespace) -> int:
     from ballast.server import Tokens, run  # noqa: PLC0415
 
@@ -330,6 +338,12 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--port", type=int, default=8080)
     s.add_argument("--tokens", help='JSON file of bearer token -> list of tenants, or ["*"]')
 
+    s = sub.add_parser("sync-vllm", help="converge a running vLLM on what the store holds")
+    s.add_argument("specs", nargs="*", help="refs or commits; every ref by default")
+    s.add_argument("--url", required=True, help="base URL of the vLLM OpenAI server")
+    s.add_argument("-o", "--out", required=True, help="directory the server reads adapters from")
+    s.add_argument("--no-prune", action="store_true", help="load, but do not unload what is gone")
+
     s = sub.add_parser("serve-export", help="materialise deltas for a serving runtime to load")
     s.add_argument("specs", nargs="*", help="refs or commits; every ref by default")
     s.add_argument("-o", "--out", required=True, help="directory of adapters")
@@ -389,6 +403,7 @@ def main(argv: list[str] | None = None) -> int:
         "reflog": cmd_reflog,
         "checkout": cmd_checkout,
         "serve": cmd_serve,
+        "sync-vllm": cmd_sync_vllm,
         "serve-export": cmd_serve_export,
         "merge": cmd_merge,
         "diff": cmd_diff,
