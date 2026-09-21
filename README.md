@@ -33,6 +33,7 @@
   <a href="#cli">CLI</a> ·
   <a href="#what-is-verified">Verification</a> ·
   <a href="docs/walkthrough.md">Walkthrough</a> ·
+  <a href="docs/verification.md">Verification</a> ·
   <a href="docs/benchmark.md">Benchmark</a> ·
   <a href="docs/scope.md">Scope</a>
 </p>
@@ -387,8 +388,9 @@ in the shapes people publish, and property-based round trips of arbitrary tensor
 through arbitrary block sizes. It also runs against a real Postgres when one is
 reachable, and in CI always.
 
-`scripts/verify_real.py` runs by hand against real systems, on CPU, and every check
-in it passes:
+`scripts/verify_real.py` runs by hand against real systems and every check in it
+passes. The output, with the versions it ran under, is in
+[docs/verification.md](docs/verification.md):
 
 - **`PeftRunner` on `HuggingFaceTB/SmolLM2-135M`.** An adapter with two layers
   retrained moves every probe. A 3% nudge to one tensor that greedy decoding cannot
@@ -420,6 +422,7 @@ the extras.
 ## Documentation
 
 - [Walkthrough](docs/walkthrough.md) — two tenants, a grant, a revocation, a deletion
+- [Verification](docs/verification.md) — the comparison against mergekit, with versions
 - [Benchmark](docs/benchmark.md) — what the storage and memory claims measure at
 - [Scope](docs/scope.md) — what this does not do, and why
 - [Adapters](docs/adapters.md) — the contract for a storage backend

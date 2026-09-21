@@ -47,6 +47,36 @@ def banner(text: str) -> None:
     print(f"\n=== {text} ===", flush=True)
 
 
+def environment() -> str:
+    """What the comparison ran against.
+
+    "Matches mergekit" says nothing without saying which mergekit: its methods
+    change between releases, and a result that does not name the version it was
+    produced under cannot be checked or contradicted later.
+    """
+    import importlib.metadata as meta
+    import subprocess
+
+    packages = ("mergekit", "torch", "transformers", "peft", "numpy", "safetensors")
+    versions = []
+    for name in packages:
+        try:
+            versions.append(f"{name} {meta.version(name)}")
+        except meta.PackageNotFoundError:
+            versions.append(f"{name} (absent)")
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=Path(__file__).resolve().parent,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        revision = "unknown"
+    return " · ".join([f"ballast {revision}", *versions])
+
+
 def make_adapters(work: Path) -> tuple[Path, Path, Path]:
     torch.manual_seed(0)
     base = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32)
@@ -434,7 +464,7 @@ def check_sparsifiers() -> bool:
 
 def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="ballast-verify-"))
-    print(f"working in {work}")
+    print(environment())
     store = Store(work / "store")
     results = [
         check_fingerprints(store, work),
