@@ -9,6 +9,12 @@ API is not yet stable.
 
 ### Added
 
+- **A benchmark,** `scripts/benchmark.py`, measuring the storage and memory
+  claims at three sizes, the largest a four-gigabyte model. Every scenario runs
+  in its own process and its fixtures are built in another, because peak
+  resident memory is a high-water mark that freeing does not lower. Results and
+  method in [docs/benchmark.md](docs/benchmark.md); the small size runs in CI.
+
 - **Fifteen merge methods resolve**, up from five: `slerp`, `nuslerp`,
   `multislerp`, `breadcrumbs`, `breadcrumbs_ties`, `della`, `della_linear`,
   `model_stock`, `sce` and `passthrough` joined the four that already did. Each
@@ -76,6 +82,13 @@ API is not yet stable.
   unobserved-change threshold with a similarity score for probes that moved.
 
 ### Fixed
+
+- **Writing a tensor copied it first.** Every write went through `tobytes()`,
+  which builds a second copy of the tensor before the write: a few megabytes per
+  tensor, gigabytes over a model, and enough to make the streaming apply slower
+  than the version that holds everything in memory. Tensors are written straight
+  from the array now, and the copy is kept only for destinations with no file
+  descriptor, such as an HTTP response body. Found by the benchmark.
 
 - **Merging refused the ordinary case.** Two fine-tunes of the same base rarely
   touch the same tensors, so `delta` produces deltas with different tensor sets

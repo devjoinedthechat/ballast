@@ -54,3 +54,5 @@ jobs:
           print('core works without torch, boto3 or psycopg')
           "
       - run: python -c "import ballast.runners, ballast.serving"
+      - name: The benchmark runs
+        run: python scripts/benchmark.py --size s

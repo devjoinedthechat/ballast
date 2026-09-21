@@ -33,6 +33,7 @@
   <a href="#cli">CLI</a> ·
   <a href="#what-is-verified">Verification</a> ·
   <a href="docs/walkthrough.md">Walkthrough</a> ·
+  <a href="docs/benchmark.md">Benchmark</a> ·
   <a href="docs/scope.md">Scope</a>
 </p>
 
@@ -100,8 +101,10 @@ reported as exactly that.
 - **Fifteen merge methods that resolve**, each matching mergekit's own functions
   numerically: linear, task arithmetic, TIES, DARE, SLERP, nuSLERP, multiSLERP,
   breadcrumbs, DELLA, Model Stock, SCE and passthrough.
-- **Bounded memory.** Tensors are read block by block and written one at a time,
-  so applying a delta to a 70B model costs one tensor, not a model.
+- **Bounded memory.** Tensors are read block by block and written one at a time.
+  Applying a delta to a 4 GB model holds one model less than building it in
+  memory, and resolving a view holds one tensor per input rather than one model
+  per input — [measured](docs/benchmark.md), at three sizes.
 
 ## Quickstart
 
@@ -417,6 +420,7 @@ the extras.
 ## Documentation
 
 - [Walkthrough](docs/walkthrough.md) — two tenants, a grant, a revocation, a deletion
+- [Benchmark](docs/benchmark.md) — what the storage and memory claims measure at
 - [Scope](docs/scope.md) — what this does not do, and why
 - [Adapters](docs/adapters.md) — the contract for a storage backend
 - [Contributing](CONTRIBUTING.md) — the layout, and what a change needs

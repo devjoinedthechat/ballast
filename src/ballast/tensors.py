@@ -153,7 +153,7 @@ def save(path: Path | str, tensors: dict[str, np.ndarray], metadata: dict[str, s
         f.write(struct.pack("<Q", len(encoded)))
         f.write(encoded)
         for name in ordered:
-            np.ascontiguousarray(tensors[name]).view(np.uint8).reshape(-1).tofile(f)
+            _write_tensor(f, np.ascontiguousarray(tensors[name]))
 
 
 def save_stream(
@@ -184,7 +184,7 @@ def save_stream(
         for name in sorted(specs):
             array = np.ascontiguousarray(produce(name))
             _check(name, array, specs[name])
-            f.write(array.view(np.uint8).reshape(-1).tobytes())
+            _write_tensor(f, array)
             del array
 
     if isinstance(target, (str, Path)):
@@ -211,7 +211,7 @@ def stream_writer(
     for name in sorted(specs):
         array = np.ascontiguousarray(produce(name))
         _check(name, array, specs[name])
-        handle.write(array.view(np.uint8).reshape(-1).tobytes())
+        _write_tensor(handle, array)
         yield name, array
     del header
 
@@ -237,6 +237,24 @@ def _header(
     encoded = json.dumps(header, separators=(",", ":")).encode()
     encoded += b" " * (-len(encoded) % 8)
     return header, encoded
+
+
+def _write_tensor(handle: BinaryIO, array: np.ndarray) -> None:
+    """Put a tensor's bytes on a handle without copying them first.
+
+    `tobytes()` builds a second copy of the tensor before the write, which on a
+    multi-gigabyte model is gigabytes of copying for nothing. `tofile` writes
+    straight from the array, but it needs a real descriptor, so a buffer that
+    has none falls back.
+    """
+    flat = array.view(np.uint8).reshape(-1)
+    try:
+        handle.fileno()
+    except (AttributeError, OSError, ValueError):
+        handle.write(flat.tobytes())
+        return
+    handle.flush()
+    flat.tofile(handle)
 
 
 def _check(name: str, array: np.ndarray, spec: tuple[str, Sequence[int]]) -> None:
