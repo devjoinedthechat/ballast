@@ -81,7 +81,7 @@ def make_adapters(work: Path) -> tuple[Path, Path, Path]:
 def check_fingerprints(store: Store, work: Path) -> bool:
     banner("1+2: PeftRunner on a live model")
     v1, v2, v3 = make_adapters(work)
-    runner = PeftRunner(MODEL, max_new_tokens=12)
+    runner = PeftRunner(MODEL, max_new_tokens=12)  # in-process: no export between store and model
     ok = True
     ids = {}
     for tag, path in (("v1", v1), ("v2", v2), ("v3", v3)):
@@ -263,6 +263,34 @@ def check_mergekit(store: Store, work: Path) -> bool:
         print("PASS: ties view matches mergekit up to entries tied at the density boundary")
     else:
         print("FAIL: ties view differs from mergekit beyond boundary ties")
+        ok = False
+
+    # The full round trip a mergekit user takes: extract deltas from model
+    # directories, merge as a view, apply back onto the base, load the result.
+    banner("4: delta -> view -> apply reproduces mergekit's output model")
+    from ballast import models
+
+    models.commit_delta(store, "rt", a_dir, base_dir, message="delta a", ref="a")
+    models.commit_delta(store, "rt", b_dir, base_dir, message="delta b", ref="b")
+    view = store.merge("rt", "linear", [("a", 0.7), ("b", 0.3)], message="linear view", ref="lin")
+    rebuilt_dir = models.apply_commit(store, "rt", view.id, base_dir, work / "rebuilt")
+    rebuilt = load_model_tensors(rebuilt_dir)
+    mk_linear = load_model_tensors(work / "mk-linear")
+    worst = max(float(np.max(np.abs(f32(rebuilt[k]) - f32(mk_linear[k])))) for k in mk_linear)
+    untouched = [k for k in mk_linear if k not in names]
+    exact = all(np.array_equal(rebuilt[k].view(np.uint8), mk_linear[k].view(np.uint8)) for k in untouched)
+    print(
+        f"apply: {len(mk_linear)} tensors, max abs difference vs mergekit's model {worst:.2e}; "
+        f"{len(untouched)} untouched tensors byte-identical: {exact}"
+    )
+    from transformers import AutoModelForCausalLM
+
+    AutoModelForCausalLM.from_pretrained(rebuilt_dir, dtype=torch.float32)
+    print("apply: transformers loads the rebuilt directory")
+    if worst < 1e-5 and exact:
+        print("PASS: the model-directory round trip reproduces mergekit's output")
+    else:
+        print("FAIL: the rebuilt model differs from mergekit's output")
         ok = False
     return ok
 

@@ -1,10 +1,10 @@
 """Resolve a composite manifest to tensors.
 
 A composite is a view. It stores no tensors; it names its inputs and a method,
-and the tensors are computed when something asks for them. Two methods are
-implemented, and they are the two that account for nearly all merges of deltas
-in practice. Others are recorded for provenance and refuse to resolve rather
-than silently doing something else.
+and the tensors are computed when something asks for them. Two methods resolve —
+linear (which task arithmetic over deltas is) and TIES — and they account for
+most merges of deltas in practice. Every other method is recorded for provenance
+and refuses to resolve, rather than silently running a different one.
 
 Arithmetic runs in float32 and casts back to the first input's dtype, so bf16
 inputs do not accumulate rounding across a long sum.
@@ -16,20 +16,25 @@ from collections.abc import Sequence
 
 import numpy as np
 
-RESOLVABLE = ("linear", "task_arithmetic", "ties", "dare_ties")
-RECORD_ONLY = ("slerp", "passthrough", "breadcrumbs", "model_stock", "della")
+RESOLVABLE = ("linear", "task_arithmetic", "ties")
+# DARE drops entries at random and rescales the survivors; resolving it needs a
+# stored seed to be reproducible, and until that exists it is recorded, not run.
+RECORD_ONLY = ("dare_ties", "dare_linear", "slerp", "passthrough", "breadcrumbs", "model_stock", "della")
 
 
-def linear(inputs: Sequence[dict[str, np.ndarray]], weights: Sequence[float]) -> dict[str, np.ndarray]:
+def linear(
+    inputs: Sequence[dict[str, np.ndarray]], weights: Sequence[float], strict: bool = True
+) -> dict[str, np.ndarray]:
     """Weighted sum. Task arithmetic over deltas is the same operation."""
-    names = _shared_names(inputs)
+    names, template = _names(inputs, strict)
     out: dict[str, np.ndarray] = {}
     for name in names:
-        dtype = inputs[0][name].dtype
-        acc = np.zeros(inputs[0][name].shape, dtype=np.float32)
+        ref = template[name]
+        acc = np.zeros(ref.shape, dtype=np.float32)
         for tensors, weight in zip(inputs, weights, strict=True):
-            acc += weight * tensors[name].astype(np.float32)
-        out[name] = acc.astype(dtype)
+            if name in tensors:
+                acc += weight * tensors[name].astype(np.float32)
+        out[name] = acc.astype(ref.dtype)
     return out
 
 
@@ -37,6 +42,7 @@ def ties(
     inputs: Sequence[dict[str, np.ndarray]],
     weights: Sequence[float],
     density: float = 0.2,
+    strict: bool = True,
 ) -> dict[str, np.ndarray]:
     """TIES: trim, elect sign, disjoint merge (Yadav et al., 2023).
 
@@ -52,11 +58,15 @@ def ties(
     """
     if not 0.0 < density <= 1.0:
         raise ValueError(f"density must be in (0, 1], got {density}")
-    names = _shared_names(inputs)
+    names, template = _names(inputs, strict)
     out: dict[str, np.ndarray] = {}
     for name in names:
-        dtype = inputs[0][name].dtype
-        trimmed = [_trim(t[name].astype(np.float32), density) for t in inputs]
+        ref = template[name]
+        dtype = ref.dtype
+        trimmed = [
+            _trim(t[name].astype(np.float32), density) if name in t else np.zeros(ref.shape, dtype=np.float32)
+            for t in inputs
+        ]
         stacked = np.stack([w * t for t, w in zip(trimmed, weights, strict=True)])
         elected = np.where(stacked.sum(axis=0) >= 0, 1.0, -1.0)
         agrees = np.sign(stacked) == elected
@@ -86,19 +96,31 @@ def _trim(array: np.ndarray, density: float) -> np.ndarray:
     return np.where(mask.reshape(array.shape), array, 0.0)
 
 
-def _shared_names(inputs: Sequence[dict[str, np.ndarray]]) -> list[str]:
+def _names(inputs: Sequence[dict[str, np.ndarray]], strict: bool) -> tuple[list[str], dict[str, np.ndarray]]:
+    """The tensors to merge, and one representative of each for shape and dtype.
+
+    Strict requires every input to carry the same tensors. Non-strict takes the
+    union and treats a tensor an input lacks as zero, which is what two adapters
+    over the same base with different target modules need.
+    """
     if not inputs:
         raise ValueError("a merge needs at least one input")
     names = set(inputs[0])
     for tensors in inputs[1:]:
-        if set(tensors) != names:
+        if strict and set(tensors) != names:
             missing = sorted(names.symmetric_difference(tensors))
-            raise ValueError(f"inputs do not share the same tensors; differ on {missing[:5]}")
+            raise ValueError(
+                f"inputs do not share the same tensors; differ on {missing[:5]} (use strict=False to union)"
+            )
+        names |= set(tensors)
+    template: dict[str, np.ndarray] = {}
     for name in names:
-        shapes = {t[name].shape for t in inputs}
+        present = [t[name] for t in inputs if name in t]
+        shapes = {t.shape for t in present}
         if len(shapes) != 1:
             raise ValueError(f"tensor {name!r} has different shapes across inputs: {shapes}")
-    return sorted(names)
+        template[name] = present[0]
+    return sorted(names), template
 
 
 def resolve(
@@ -106,11 +128,12 @@ def resolve(
     inputs: Sequence[dict[str, np.ndarray]],
     weights: Sequence[float],
     density: float | None = None,
+    strict: bool = True,
 ) -> dict[str, np.ndarray]:
     if method in ("linear", "task_arithmetic"):
-        return linear(inputs, weights)
-    if method in ("ties", "dare_ties"):
-        return ties(inputs, weights, density if density is not None else 0.2)
+        return linear(inputs, weights, strict)
+    if method == "ties":
+        return ties(inputs, weights, density if density is not None else 0.2, strict)
     if method in RECORD_ONLY:
         raise NotImplementedError(
             f"{method!r} is recorded for provenance but not resolved here; "

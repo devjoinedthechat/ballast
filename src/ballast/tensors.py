@@ -2,13 +2,20 @@
 
 The reference library's numpy path refuses bfloat16, and most adapters are
 bfloat16. The format itself is small — an 8-byte header length, a JSON header, a
-byte buffer — so reading it here costs twenty lines and buys a store that runs
+byte buffer — so reading it here costs a page of code and buys a store that runs
 without torch. `ml_dtypes` supplies the numpy bfloat16 and float8 types.
+
+The reader takes files from users, so the header is validated before any byte
+is interpreted: every offset in range, every span the size its dtype and shape
+say, no two spans overlapping. A malformed file raises `MalformedSafetensors`
+with the tensor and the reason, never a numpy error from deep inside.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
+import math
 import struct
 from pathlib import Path
 from typing import Any
@@ -32,6 +39,12 @@ DTYPES: dict[str, np.dtype[Any]] = {
 }
 NAMES: dict[np.dtype[Any], str] = {v: k for k, v in DTYPES.items()}
 
+MAX_HEADER_BYTES = 100 * 1024 * 1024
+
+
+class MalformedSafetensors(ValueError):
+    """The file does not describe its own bytes correctly."""
+
 
 def dtype_name(dtype: np.dtype[Any]) -> str:
     try:
@@ -40,23 +53,80 @@ def dtype_name(dtype: np.dtype[Any]) -> str:
         raise TypeError(f"{dtype} has no safetensors encoding") from None
 
 
-def load(path: Path | str) -> tuple[dict[str, np.ndarray], dict[str, str]]:
-    """Tensors and the file's metadata block."""
-    path = Path(path)
-    with path.open("rb") as f:
-        (header_len,) = struct.unpack("<Q", f.read(8))
-        header = json.loads(f.read(header_len))
-    data = np.memmap(path, mode="r", offset=8 + header_len)
+def _validate(header: dict[str, Any], data_len: int, path: Path) -> list[tuple[str, dict[str, Any]]]:
+    if not isinstance(header, dict):
+        raise MalformedSafetensors(f"{path}: header is not an object")
+    spans: list[tuple[int, int, str]] = []
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for name, entry in header.items():
+        if name == "__metadata__":
+            continue
+        if not isinstance(entry, dict):
+            raise MalformedSafetensors(f"{path}: {name!r} is not an object")
+        dtype = entry.get("dtype")
+        if dtype not in DTYPES:
+            raise MalformedSafetensors(f"{path}: {name!r} has unknown dtype {dtype!r}")
+        shape = entry.get("shape")
+        if not isinstance(shape, list) or not all(isinstance(d, int) and d >= 0 for d in shape):
+            raise MalformedSafetensors(f"{path}: {name!r} has invalid shape {shape!r}")
+        offsets = entry.get("data_offsets")
+        if not isinstance(offsets, list) or len(offsets) != 2 or not all(isinstance(o, int) for o in offsets):
+            raise MalformedSafetensors(f"{path}: {name!r} has invalid data_offsets {offsets!r}")
+        start, end = offsets
+        if not 0 <= start <= end <= data_len:
+            raise MalformedSafetensors(
+                f"{path}: {name!r} offsets [{start}, {end}) fall outside the {data_len}-byte buffer"
+            )
+        expected = math.prod(shape) * DTYPES[dtype].itemsize
+        if end - start != expected:
+            raise MalformedSafetensors(
+                f"{path}: {name!r} spans {end - start} bytes but {dtype} {shape} needs {expected}"
+            )
+        spans.append((start, end, name))
+        entries.append((name, entry))
+    spans.sort()
+    for (_, e0, n0), (s1, _, n1) in itertools.pairwise(spans):
+        if s1 < e0:
+            raise MalformedSafetensors(f"{path}: {n0!r} and {n1!r} overlap")
+    return entries
 
-    metadata = header.pop("__metadata__", {}) or {}
+
+def read_header(path: Path | str) -> tuple[dict[str, Any], int]:
+    """The parsed header and the byte offset where data begins."""
+    path = Path(path)
+    size = path.stat().st_size
+    with path.open("rb") as f:
+        raw = f.read(8)
+        if len(raw) < 8:
+            raise MalformedSafetensors(f"{path}: shorter than its own length prefix")
+        (header_len,) = struct.unpack("<Q", raw)
+        if header_len <= 0 or header_len > MAX_HEADER_BYTES or 8 + header_len > size:
+            raise MalformedSafetensors(
+                f"{path}: header length {header_len} is impossible for a {size}-byte file"
+            )
+        try:
+            header = json.loads(f.read(header_len))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise MalformedSafetensors(f"{path}: header is not valid JSON: {exc}") from None
+    return header, 8 + header_len
+
+
+def load(path: Path | str) -> tuple[dict[str, np.ndarray], dict[str, str]]:
+    """Tensors and the file's metadata block. Tensors are memory-mapped views."""
+    path = Path(path)
+    header, data_start = read_header(path)
+    data_len = path.stat().st_size - data_start
+    entries = _validate(header, data_len, path)
+    metadata = header.get("__metadata__") or {}
+    if not isinstance(metadata, dict):
+        raise MalformedSafetensors(f"{path}: __metadata__ is not an object")
+
+    data = np.memmap(path, mode="r", offset=data_start) if data_len else np.empty(0, dtype=np.uint8)
     tensors: dict[str, np.ndarray] = {}
-    for name in sorted(header):
-        entry = header[name]
+    for name, entry in sorted(entries):
         start, end = entry["data_offsets"]
-        dtype = DTYPES[entry["dtype"]]
-        buffer = data[start:end]
-        tensors[name] = np.frombuffer(buffer, dtype=dtype).reshape(entry["shape"])
-    return tensors, metadata
+        tensors[name] = np.frombuffer(data[start:end], dtype=DTYPES[entry["dtype"]]).reshape(entry["shape"])
+    return tensors, {str(k): str(v) for k, v in metadata.items()}
 
 
 def save(path: Path | str, tensors: dict[str, np.ndarray], metadata: dict[str, str] | None = None) -> None:
@@ -82,7 +152,23 @@ def save(path: Path | str, tensors: dict[str, np.ndarray], metadata: dict[str, s
         f.write(struct.pack("<Q", len(encoded)))
         f.write(encoded)
         for name in ordered:
-            f.write(np.ascontiguousarray(tensors[name]).tobytes())
+            np.ascontiguousarray(tensors[name]).view(np.uint8).reshape(-1).tofile(f)
+
+
+def load_dir(directory: Path | str) -> dict[str, np.ndarray]:
+    """Every tensor from every safetensors shard in a model directory."""
+    directory = Path(directory)
+    files = sorted(directory.glob("*.safetensors"))
+    if not files:
+        raise FileNotFoundError(f"no .safetensors files under {directory}")
+    out: dict[str, np.ndarray] = {}
+    for file in files:
+        tensors, _ = load(file)
+        for name, array in tensors.items():
+            if name in out:
+                raise MalformedSafetensors(f"{directory}: {name!r} appears in more than one shard")
+            out[name] = array
+    return out
 
 
 def to_f32(array: np.ndarray) -> np.ndarray:

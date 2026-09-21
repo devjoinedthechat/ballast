@@ -9,7 +9,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from ballast import mergekit
+from ballast import mergekit, models
 from ballast import peft as peft_io
 from ballast.fingerprint import FakeRunner, ProbeSet, Runner, fingerprint
 from ballast.store import BrokenView, NotGranted, Store
@@ -40,6 +40,28 @@ def cmd_commit(store: Store, a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delta(store: Store, a: argparse.Namespace) -> int:
+    metadata = json.loads(a.metadata) if a.metadata else {}
+    commit, report = models.commit_delta(
+        store, a.tenant, a.model, a.base, message=a.message, ref=a.ref, dtype=a.dtype, metadata=metadata
+    )
+    text = f"{commit.short}  {len(report.changed)} tensors changed, {len(report.unchanged)} unchanged  ref {a.ref}"
+    if report.mismatched or report.only_in_model or report.only_in_base:
+        text += f"\n  skipped: {report.summary()}"
+    _emit(a, text, {**asdict(commit), "report": report.summary()})
+    return 0
+
+
+def cmd_apply(store: Store, a: argparse.Namespace) -> int:
+    try:
+        out = models.apply_commit(store, a.tenant, a.spec, a.base, a.out)
+    except BrokenView as exc:
+        print(f"cannot apply: {exc}", file=sys.stderr)
+        return 2
+    _emit(a, f"model written to {out}", {"out": str(out)})
+    return 0
+
+
 def cmd_log(store: Store, a: argparse.Namespace) -> int:
     commits = store.log(a.tenant, a.ref, limit=a.limit)
     lines = []
@@ -47,6 +69,16 @@ def cmd_log(store: Store, a: argparse.Namespace) -> int:
         kind = store.manifest(a.tenant, c.manifest_id).kind
         lines.append(f"{c.short}  {kind:<9}  {c.message}")
     _emit(a, "\n".join(lines), [asdict(c) for c in commits])
+    return 0
+
+
+def cmd_reflog(store: Store, a: argparse.Namespace) -> int:
+    entries = store.reflog(a.tenant, a.ref, limit=a.limit)
+    lines = [
+        f"{e.position:>4}  {e.op:<7}  {(e.old_commit or '-')[:12]:<12} -> {(e.new_commit or '-')[:12]}"
+        for e in entries
+    ]
+    _emit(a, "\n".join(lines) or "no history", [asdict(e) for e in entries])
     return 0
 
 
@@ -88,7 +120,9 @@ def cmd_merge(store: Store, a: argparse.Namespace) -> int:
             spec, weight = item, ""
         inputs.append((spec, float(weight) if weight else 1.0))
     try:
-        commit = store.merge(a.tenant, a.method, inputs, message=a.message, ref=a.ref, density=a.density)
+        commit = store.merge(
+            a.tenant, a.method, inputs, message=a.message, ref=a.ref, density=a.density, strict=not a.union
+        )
     except NotGranted as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 3
@@ -97,7 +131,7 @@ def cmd_merge(store: Store, a: argparse.Namespace) -> int:
 
 
 def cmd_diff(store: Store, a: argparse.Namespace) -> int:
-    diff = store.diff(a.tenant, a.a, a.b, probe_set=a.probe_set)
+    diff = store.diff(a.tenant, a.a, a.b, probe_set=a.probe_set, threshold=a.threshold)
     _emit(a, str(diff), {**asdict(diff), "unobserved": diff.unobserved})
     return 0
 
@@ -132,8 +166,7 @@ def cmd_grant(store: Store, a: argparse.Namespace) -> int:
 
 def cmd_revoke(store: Store, a: argparse.Namespace) -> int:
     broken = store.revoke(a.tenant, a.spec, a.to)
-    text = f"revoked; {len(broken)} view(s) in {a.to!r} can no longer resolve"
-    _emit(a, text, {"broken": broken})
+    _emit(a, f"revoked; {len(broken)} view(s) in {a.to!r} can no longer resolve", {"broken": broken})
     return 0
 
 
@@ -149,10 +182,11 @@ def cmd_grants(store: Store, a: argparse.Namespace) -> int:
 def cmd_stats(store: Store, a: argparse.Namespace) -> int:
     s = store.stats(a.tenant)
     text = (
-        f"{s.commits} commits, {s.manifests} manifests, {s.chunks} chunks\n"
-        f"{s.physical_bytes:,} bytes on disk for {s.logical_bytes:,} logical ({s.dedup_ratio:.2f}x)"
+        f"{s.commits} commits, {s.manifests} manifests, {s.chunks} blocks\n"
+        f"{s.logical_bytes:,} logical bytes, {s.raw_bytes:,} unique ({s.dedup_ratio:.2f}x dedup), "
+        f"{s.physical_bytes:,} on disk ({s.compression_ratio:.2f}x compression)"
     )
-    _emit(a, text, {**asdict(s), "dedup_ratio": s.dedup_ratio})
+    _emit(a, text, {**asdict(s), "dedup_ratio": s.dedup_ratio, "compression_ratio": s.compression_ratio})
     return 0
 
 
@@ -201,19 +235,39 @@ def cmd_fingerprint(store: Store, a: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="ballast", description=__doc__)
-    p.add_argument("--root", default=".ballast", help="store directory")
+    p.add_argument(
+        "--root", default=".ballast", help="store directory (metadata, cache, and blocks unless --backend)"
+    )
+    p.add_argument("--backend", help="where blocks live: a path or s3://bucket/prefix")
     p.add_argument("--tenant", required=True)
     p.add_argument("--json", action="store_true", help="machine-readable output")
     sub = p.add_subparsers(dest="command", required=True)
 
-    s = sub.add_parser("commit", help="store an adapter directory as a new commit")
+    s = sub.add_parser("commit", help="store a PEFT adapter directory as a new commit")
     s.add_argument("adapter")
     s.add_argument("-m", "--message", required=True)
     s.add_argument("--ref", default="main")
     s.add_argument("--base-model")
     s.add_argument("--metadata", help="JSON object of provenance to keep on the commit")
 
+    s = sub.add_parser("delta", help="commit model - base from two model directories")
+    s.add_argument("model")
+    s.add_argument("--base", required=True)
+    s.add_argument("-m", "--message", required=True)
+    s.add_argument("--ref", default="main")
+    s.add_argument("--dtype", help="safetensors dtype for the delta, e.g. F32; default is the model's")
+    s.add_argument("--metadata")
+
+    s = sub.add_parser("apply", help="write a commit applied to a base as a model directory")
+    s.add_argument("spec")
+    s.add_argument("--base", required=True)
+    s.add_argument("-o", "--out", required=True)
+
     s = sub.add_parser("log")
+    s.add_argument("ref", nargs="?", default="main")
+    s.add_argument("--limit", type=int, default=50)
+
+    s = sub.add_parser("reflog", help="every move a ref made")
     s.add_argument("ref", nargs="?", default="main")
     s.add_argument("--limit", type=int, default=50)
 
@@ -227,6 +281,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("inputs", nargs="+")
     s.add_argument("--method", default="linear")
     s.add_argument("--density", type=float)
+    s.add_argument(
+        "--union", action="store_true", help="merge the union of tensors; absent ones count as zero"
+    )
     s.add_argument("-m", "--message", required=True)
     s.add_argument("--ref", default="main")
 
@@ -234,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("a")
     s.add_argument("b")
     s.add_argument("--probe-set")
+    s.add_argument("--threshold", type=float, help="relative change above which an unnoticed move is flagged")
 
     s = sub.add_parser("reset", help="point a ref at an earlier commit")
     s.add_argument("ref")
@@ -260,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("fsck", help="check the store's invariants")
     s.add_argument("--all", action="store_true", help="every tenant, not just --tenant")
-    s.add_argument("--fast", action="store_true", help="skip re-hashing chunk bytes")
+    s.add_argument("--fast", action="store_true", help="skip re-hashing block bytes")
 
     s = sub.add_parser("import-mergekit")
     s.add_argument("config")
@@ -274,10 +332,13 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--base-model")
 
     a = p.parse_args(argv)
-    store = Store(a.root)
+    store = Store(a.root, backend=a.backend)
     handlers = {
         "commit": cmd_commit,
+        "delta": cmd_delta,
+        "apply": cmd_apply,
         "log": cmd_log,
+        "reflog": cmd_reflog,
         "checkout": cmd_checkout,
         "merge": cmd_merge,
         "diff": cmd_diff,

@@ -1,37 +1,46 @@
 """The store.
 
-A tenant is a namespace. Inside it: chunks, manifests, commits, refs. A manifest
-is either a leaf (names tensors) or a composite (names other manifests and a
-merge method). Commits chain manifests into a history; refs name commits.
+A tenant is a namespace. Inside it: blocks, manifests, commits, refs. A manifest
+is either a leaf (names tensors, each an ordered run of blocks) or a composite
+(names other manifests and a merge method). Commits chain manifests into a
+history; refs name commits; the reflog remembers every move a ref made.
 
 Three decisions shape everything else.
 
 Merges are views. A composite manifest holds no tensors; it resolves at
-checkout. Deleting one of its inputs breaks it in a way the store can detect
-and report, instead of leaving the input's contribution smeared through a
+checkout, and the resolved tensors are cached until an input is deleted or a
+grant revoked. Deleting an input breaks the view in a way the store detects and
+reports, instead of leaving the input's contribution smeared through a
 materialised matrix where nothing can find it.
 
-Identity is content. Manifest and chunk ids are hashes of what they contain,
+Identity is content. Manifest and block ids are hashes of what they contain,
 so committing the same adapter twice stores nothing new, a commit that changes
-three tensors out of sixty stores three chunks, and a composite can never form a
+one value in a large tensor stores one block, and a composite can never form a
 cycle because its id depends on inputs that already exist.
 
 Deletion produces a record. Forgetting a tenant or a commit returns a proof
-naming what was removed under an attestation hash, stores the proof, and can
-re-verify it from any process afterwards. It is an audit record, not a
-cryptographic guarantee against a hostile operator; it answers "show me that it
-is gone" for an operator acting in good faith.
+naming what was removed under an attestation hash, stores the proof, signs it
+when a key is configured, and can re-verify it from any process afterwards. It
+is an audit record, not a cryptographic guarantee against a hostile operator;
+it answers "show me that it is gone" for an operator acting in good faith, and
+with a key held outside the store, it also shows the record was not rewritten.
 
 Tenants may share. A grant lets one tenant build views over another's manifest.
-The owner's chunks never move — the grantee reads through the grant — so
+The owner's blocks never move — the grantee reads through the grant — so
 revoking it, or the owner deleting the manifest, breaks the grantee's views and
 leaves nothing behind. Without a grant, a cross-tenant reference is refused.
 """
 
 from __future__ import annotations
 
+import difflib
+import hashlib
+import hmac
 import json
+import os
+import shutil
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -43,11 +52,14 @@ import numpy as np
 
 from ballast import merge as merging
 from ballast import names
-from ballast.chunks import ChunkStore, describe
+from ballast import tensors as st
+from ballast.backends import Backend, LocalBackend, from_url
+from ballast.chunks import DEFAULT_BLOCK_SIZE, ChunkStore, block_digest
 from ballast.db import connect
-from ballast.hashing import object_hash, tensor_hash
+from ballast.hashing import object_hash
 
 DEFAULT_REF = "main"
+SIGNING_KEY_ENV = "BALLAST_SIGNING_KEY"
 
 
 @dataclass(frozen=True)
@@ -89,16 +101,32 @@ class Grant:
 
 
 @dataclass(frozen=True)
+class ReflogEntry:
+    ref: str
+    position: int
+    old_commit: str | None
+    new_commit: str | None
+    op: str
+    at: float
+
+
+@dataclass(frozen=True)
 class Stats:
     commits: int
     manifests: int
     chunks: int
     physical_bytes: int
     logical_bytes: int
+    raw_bytes: int = 0
+    """Bytes the blocks hold before compression."""
 
     @property
     def dedup_ratio(self) -> float:
-        return 1.0 if not self.physical_bytes else self.logical_bytes / self.physical_bytes
+        return 1.0 if not self.raw_bytes else self.logical_bytes / self.raw_bytes
+
+    @property
+    def compression_ratio(self) -> float:
+        return 1.0 if not self.physical_bytes else self.raw_bytes / self.physical_bytes
 
 
 @dataclass(frozen=True)
@@ -119,9 +147,16 @@ class Diff:
     per-tensor maximum is tracked and gates `unobserved` alongside the
     aggregate.
     """
+    threshold: float = 0.01
     probe_set: str | None = None
     probes_changed: int | None = None
     probes_total: int | None = None
+    probes_similarity: float | None = None
+    """Mean character-level similarity of the answers that changed, 0..1.
+
+    Exact mismatch says a probe moved; this says how far. Two answers that
+    differ by one token score near 1; a rewritten answer scores low.
+    """
 
     @property
     def unobserved(self) -> bool:
@@ -133,7 +168,7 @@ class Diff:
         """
         if self.probes_total is None:
             return False
-        moved = max(self.relative_change, self.max_tensor_change) > 0.01
+        moved = max(self.relative_change, self.max_tensor_change) > self.threshold
         return moved and self.probes_changed == 0
 
     def __str__(self) -> str:
@@ -145,7 +180,10 @@ class Diff:
             f"most changed tensor",
         ]
         if self.probes_total is not None:
-            lines.append(f"  probes: {self.probes_changed} of {self.probes_total} moved")
+            similarity = (
+                "" if self.probes_similarity is None else f" (similarity {self.probes_similarity:.2f})"
+            )
+            lines.append(f"  probes: {self.probes_changed} of {self.probes_total} moved{similarity}")
         if self.unobserved:
             lines.append("  UNOBSERVED CHANGE: weights moved, no probe detected it")
         elif self.probes_total is None and self.changed:
@@ -167,12 +205,14 @@ class Proof:
     revoked_grants: tuple[str, ...]
     """Grants on deleted manifests, as `grantee:manifest_id`."""
     attestation: str
+    signature: str | None = None
+    """HMAC-SHA256 of the attestation under the store's signing key, if one was set."""
 
     def __str__(self) -> str:
         lines = [
             f"tenant {self.tenant!r}: {len(self.commits)} commits, {len(self.manifests)} manifests, "
-            f"{len(self.chunks)} chunks, {self.bytes_freed:,} bytes",
-            f"attestation {self.attestation}",
+            f"{len(self.chunks)} blocks, {self.bytes_freed:,} bytes",
+            f"attestation {self.attestation}" + ("  (signed)" if self.signature else "  (unsigned)"),
         ]
         if self.broken_composites:
             lines.append(
@@ -193,24 +233,118 @@ class NotGranted(PermissionError):
 
 
 class Store:
-    def __init__(self, root: Path | str) -> None:
+    def __init__(
+        self,
+        root: Path | str,
+        *,
+        backend: Backend | str | None = None,
+        block_size: int = DEFAULT_BLOCK_SIZE,
+        compression: str = "zstd",
+        signing_key: bytes | str | None = None,
+        cache_views: bool = True,
+        unobserved_threshold: float = 0.01,
+    ) -> None:
+        """Open or create a store.
+
+        `root` holds the metadata database, the view cache and, unless another
+        backend is given, the blocks. `backend` is a `Backend`, a path, or an
+        `s3://bucket/prefix` URL. `block_size` and `compression` are fixed when
+        a store is created and read back on every open after that.
+
+        `signing_key` (or `$BALLAST_SIGNING_KEY`) signs deletion proofs. Keep it
+        outside the store; that is what makes the signature mean something.
+        """
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        self.db = connect(self.root / "ballast.db")
-        self.chunks = ChunkStore(self.root / "chunks")
+        self._local = threading.local()
+        self._db_path = self.root / "ballast.db"
+
+        settings = self._settings()
+        if settings:
+            block_size = int(settings["block_size"])
+            compression = settings["compression"]
+        else:
+            self._write_settings({"block_size": str(block_size), "compression": compression})
+
+        if backend is None:
+            resolved: Backend = LocalBackend(self.root / "chunks")
+        elif isinstance(backend, str):
+            resolved = from_url(backend, self.root / "chunks")
+        else:
+            resolved = backend
+        self.chunks = ChunkStore(resolved, block_size=block_size, compression=compression)
+        self.cache_views = cache_views
+        self.unobserved_threshold = unobserved_threshold
+
+        key = signing_key if signing_key is not None else os.environ.get(SIGNING_KEY_ENV)
+        self._signing_key = key.encode() if isinstance(key, str) else key
+
+        if self._settings().get("rehash_pending") == "1":
+            self._rehash_v1_blocks()
+
+    # -- connections --------------------------------------------------------
+
+    @property
+    def db(self) -> sqlite3.Connection:
+        """One connection per thread. SQLite connections are not shareable."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = connect(self._db_path)
+            self._local.conn = conn
+        return conn
 
     def close(self) -> None:
-        self.db.close()
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
-        self.db.execute("BEGIN IMMEDIATE")
+        db = self.db
+        db.execute("BEGIN IMMEDIATE")
         try:
-            yield self.db
-            self.db.execute("COMMIT")
+            yield db
+            db.execute("COMMIT")
         except Exception:
-            self.db.execute("ROLLBACK")
+            db.execute("ROLLBACK")
             raise
+
+    def _settings(self) -> dict[str, str]:
+        rows = self.db.execute("SELECT key, value FROM settings").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def _write_settings(self, values: dict[str, str]) -> None:
+        with self._tx() as db:
+            db.executemany(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                list(values.items()),
+            )
+
+    def _rehash_v1_blocks(self) -> None:
+        """Version-1 blocks were addressed by a hash that covered dtype and shape.
+
+        Version 2 addresses a block by its bytes alone, so the same bytes
+        deduplicate whatever tensor they belong to. Finish the migration by
+        renaming every block to its new address. This reads every block once.
+        """
+        rows = self.db.execute("SELECT tenant, hash, nbytes FROM chunks").fetchall()
+        with self._tx() as db:
+            for r in rows:
+                tenant, old = r["tenant"], r["hash"]
+                data = self.chunks.backend.get(tenant, old)
+                new = block_digest(data)
+                if new == old:
+                    continue
+                self.chunks.backend.put(tenant, new, data)
+                self.chunks.backend.delete(tenant, old)
+                db.execute(
+                    "UPDATE tensor_blocks SET chunk_hash = ? WHERE tenant = ? AND chunk_hash = ?",
+                    (new, tenant, old),
+                )
+                db.execute("UPDATE chunks SET hash = ? WHERE tenant = ? AND hash = ?", (new, tenant, old))
+            db.execute("DELETE FROM settings WHERE key = 'rehash_pending'")
 
     # -- write --------------------------------------------------------------
 
@@ -239,33 +373,48 @@ class Store:
         config = config or {}
         now = time.time()
 
-        entries = []
         with self._tx() as db:
+            known_rows = {
+                r["hash"] for r in db.execute("SELECT hash FROM chunks WHERE tenant = ?", (tenant,))
+            }
+            records = []
             for name in sorted(tensors):
-                array = tensors[name]
-                digest = tensor_hash(array)
-                meta = describe(array)
-                self.chunks.put(tenant, digest, array)
-                db.execute(
-                    "INSERT OR IGNORE INTO chunks (tenant, hash, dtype, shape, nbytes, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (tenant, digest, meta["dtype"], meta["shape"], meta["nbytes"], now),
-                )
-                entries.append((name, digest, meta["dtype"], meta["shape"]))
+                record = self.chunks.put_tensor(tenant, tensors[name], known=known_rows.__contains__)
+                for block in record.blocks:
+                    if block.new:
+                        db.execute(
+                            "INSERT INTO chunks (tenant, hash, nbytes, stored_bytes, encoding, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (tenant, block.digest, block.nbytes, block.stored_bytes, block.encoding, now),
+                        )
+                        known_rows.add(block.digest)
+                records.append((name, record))
 
             manifest_id = object_hash(
-                {"kind": "leaf", "base_model": base_model, "config": config, "tensors": entries}
+                {
+                    "kind": "leaf",
+                    "base_model": base_model,
+                    "config": config,
+                    "tensors": [(name, rec.identity()) for name, rec in records],
+                }
             )
-            db.execute(
+            fresh = db.execute(
                 "INSERT OR IGNORE INTO manifests (tenant, id, kind, base_model, config, created_at) "
                 "VALUES (?, ?, 'leaf', ?, ?, ?)",
                 (tenant, manifest_id, base_model, json.dumps(config, sort_keys=True), now),
-            )
-            db.executemany(
-                "INSERT OR IGNORE INTO manifest_tensors (tenant, manifest_id, name, chunk_hash) "
-                "VALUES (?, ?, ?, ?)",
-                [(tenant, manifest_id, name, digest) for name, digest, _, _ in entries],
-            )
+            ).rowcount
+            if fresh:
+                for name, rec in records:
+                    db.execute(
+                        "INSERT INTO manifest_tensors (tenant, manifest_id, name, dtype, shape, nbytes) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (tenant, manifest_id, name, rec.dtype, json.dumps(list(rec.shape)), rec.nbytes),
+                    )
+                    db.executemany(
+                        "INSERT INTO tensor_blocks (tenant, manifest_id, name, position, chunk_hash) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        [(tenant, manifest_id, name, i, d) for i, d in enumerate(rec.digests)],
+                    )
             return self._commit_manifest(db, tenant, manifest_id, message, ref, parent, metadata or {}, now)
 
     def merge(
@@ -277,6 +426,7 @@ class Store:
         message: str,
         ref: str = DEFAULT_REF,
         density: float | None = None,
+        strict: bool = True,
         metadata: dict[str, Any] | None = None,
         parent: str | None = None,
     ) -> Commit:
@@ -286,7 +436,8 @@ class Store:
         result out, and only for as long as every input still exists.
 
         An input is a ref or commit id in this tenant, or `other:ref` for a
-        manifest another tenant has granted.
+        manifest another tenant has granted. `strict=False` merges the union of
+        the inputs' tensors, treating a tensor an input lacks as zero.
         """
         names.tenant(tenant)
         names.ref(ref)
@@ -312,6 +463,8 @@ class Store:
         config: dict[str, Any] = {"method": method}
         if density is not None:
             config["density"] = density
+        if not strict:
+            config["strict"] = False
         manifest_id = object_hash(
             {"kind": "composite", "base_model": base_model, "config": config, "inputs": resolved}
         )
@@ -347,8 +500,8 @@ class Store:
         metadata: dict[str, Any],
         now: float,
     ) -> Commit:
+        head = self.head(tenant, ref)
         if parent is None:
-            head = self.head(tenant, ref)
             parent = head.id if head else None
         commit_id = object_hash(
             {"tenant": tenant, "manifest": manifest_id, "parent": parent, "message": message, "at": now}
@@ -358,25 +511,58 @@ class Store:
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (tenant, commit_id, manifest_id, parent, message, json.dumps(metadata, sort_keys=True), now),
         )
-        db.execute(
-            "INSERT INTO refs (tenant, name, commit_id) VALUES (?, ?, ?) "
-            "ON CONFLICT (tenant, name) DO UPDATE SET commit_id = excluded.commit_id",
-            (tenant, ref, commit_id),
-        )
+        self._move_ref(db, tenant, ref, head.id if head else None, commit_id, "commit", now)
         return Commit(tenant, commit_id, manifest_id, parent, message, now, metadata)
+
+    def _move_ref(
+        self,
+        db: sqlite3.Connection,
+        tenant: str,
+        ref: str,
+        old: str | None,
+        new: str | None,
+        op: str,
+        now: float,
+    ) -> None:
+        if new is None:
+            db.execute("DELETE FROM refs WHERE tenant = ? AND name = ?", (tenant, ref))
+        else:
+            db.execute(
+                "INSERT INTO refs (tenant, name, commit_id) VALUES (?, ?, ?) "
+                "ON CONFLICT (tenant, name) DO UPDATE SET commit_id = excluded.commit_id",
+                (tenant, ref, new),
+            )
+        position = db.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM reflog WHERE tenant = ? AND ref = ?", (tenant, ref)
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO reflog (tenant, ref, position, old_commit, new_commit, op, at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (tenant, ref, position, old, new, op, now),
+        )
 
     def reset(self, tenant: str, ref: str, target: str) -> Commit:
         """Point `ref` at an earlier commit. Nothing is deleted; this is rollback."""
         names.tenant(tenant)
         names.ref(ref)
         commit = self.resolve(tenant, target)
+        head = self.head(tenant, ref)
         with self._tx() as db:
-            db.execute(
-                "INSERT INTO refs (tenant, name, commit_id) VALUES (?, ?, ?) "
-                "ON CONFLICT (tenant, name) DO UPDATE SET commit_id = excluded.commit_id",
-                (tenant, ref, commit.id),
-            )
+            self._move_ref(db, tenant, ref, head.id if head else None, commit.id, "reset", time.time())
         return commit
+
+    def reflog(self, tenant: str, ref: str, limit: int = 100) -> list[ReflogEntry]:
+        """Every move `ref` made, newest first."""
+        names.tenant(tenant)
+        names.ref(ref)
+        rows = self.db.execute(
+            "SELECT * FROM reflog WHERE tenant = ? AND ref = ? ORDER BY position DESC LIMIT ?",
+            (tenant, ref, limit),
+        ).fetchall()
+        return [
+            ReflogEntry(r["ref"], r["position"], r["old_commit"], r["new_commit"], r["op"], r["at"])
+            for r in rows
+        ]
 
     # -- grants -------------------------------------------------------------
 
@@ -409,7 +595,9 @@ class Store:
                 "AND revoked_at IS NULL",
                 (time.time(), owner, commit.manifest_id, grantee),
             )
-        return self._views_over(owner, commit.manifest_id, only_tenant=grantee)
+        broken = self._views_over(owner, commit.manifest_id, only_tenant=grantee)
+        self._drop_cache(broken)
+        return broken
 
     def grants(self, tenant: str) -> list[Grant]:
         """Grants this tenant has given or received, live ones first."""
@@ -510,6 +698,18 @@ class Store:
         ).fetchall()
         return [(r["input_tenant"], r["input_id"], r["weight"]) for r in rows]
 
+    def tensor_blocks(self, tenant: str, manifest_id: str) -> dict[str, tuple[str, ...]]:
+        """Each tensor's block digests, for a leaf manifest."""
+        rows = self.db.execute(
+            "SELECT name, chunk_hash FROM tensor_blocks WHERE tenant = ? AND manifest_id = ? "
+            "ORDER BY name, position",
+            (tenant, manifest_id),
+        ).fetchall()
+        out: dict[str, list[str]] = {}
+        for r in rows:
+            out.setdefault(r["name"], []).append(r["chunk_hash"])
+        return {k: tuple(v) for k, v in out.items()}
+
     def log(self, tenant: str, spec: str = DEFAULT_REF, limit: int = 100) -> list[Commit]:
         out: list[Commit] = []
         current: str | None = self.resolve(tenant, spec).id
@@ -529,16 +729,11 @@ class Store:
             raise BrokenView(f"grant on {tenant}:{manifest_id[:12]} for {viewer!r} is missing or revoked")
         manifest = self.manifest(tenant, manifest_id)
         if manifest.kind == "leaf":
-            rows = self.db.execute(
-                "SELECT t.name, t.chunk_hash, c.dtype, c.shape FROM manifest_tensors t "
-                "JOIN chunks c ON c.tenant = t.tenant AND c.hash = t.chunk_hash "
-                "WHERE t.tenant = ? AND t.manifest_id = ? ORDER BY t.name",
-                (tenant, manifest_id),
-            ).fetchall()
-            return {
-                r["name"]: self.chunks.get(tenant, r["chunk_hash"], r["dtype"], json.loads(r["shape"]))
-                for r in rows
-            }
+            return self._load_leaf(tenant, manifest_id)
+
+        cached = self._cache_path(tenant, manifest_id)
+        if self.cache_views and cached.exists():
+            return st.load(cached)[0]
 
         parts = self.inputs(tenant, manifest_id)
         try:
@@ -548,27 +743,80 @@ class Store:
         except BrokenView as exc:
             raise BrokenView(f"composite {manifest_id[:12]} cannot resolve: {exc}") from exc
         weights = [w for _, _, w in parts]
-        return merging.resolve(manifest.config["method"], resolved, weights, manifest.config.get("density"))
+        out = merging.resolve(
+            manifest.config["method"],
+            resolved,
+            weights,
+            manifest.config.get("density"),
+            manifest.config.get("strict", True),
+        )
+        if self.cache_views:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cached.with_suffix(".tmp")
+            st.save(tmp, out)
+            tmp.replace(cached)
+        return out
+
+    def _load_leaf(self, tenant: str, manifest_id: str) -> dict[str, np.ndarray]:
+        tensors = self.db.execute(
+            "SELECT name, dtype, shape FROM manifest_tensors WHERE tenant = ? AND manifest_id = ? "
+            "ORDER BY name",
+            (tenant, manifest_id),
+        ).fetchall()
+        blocks = self.db.execute(
+            "SELECT b.name, b.chunk_hash, c.encoding, c.nbytes FROM tensor_blocks b "
+            "JOIN chunks c ON c.tenant = b.tenant AND c.hash = b.chunk_hash "
+            "WHERE b.tenant = ? AND b.manifest_id = ? ORDER BY b.name, b.position",
+            (tenant, manifest_id),
+        ).fetchall()
+        by_name: dict[str, list[tuple[str, str, int]]] = {}
+        for r in blocks:
+            by_name.setdefault(r["name"], []).append((r["chunk_hash"], r["encoding"], r["nbytes"]))
+        return {
+            r["name"]: self.chunks.get_tensor(
+                tenant, r["dtype"], json.loads(r["shape"]), by_name.get(r["name"], [])
+            )
+            for r in tensors
+        }
+
+    def _cache_path(self, tenant: str, manifest_id: str) -> Path:
+        return self.root / "cache" / tenant / f"{manifest_id}.safetensors"
+
+    def _drop_cache(self, views: Sequence[str]) -> None:
+        for item in views:
+            tenant, _, manifest_id = item.partition(":")
+            self._cache_path(tenant, manifest_id).unlink(missing_ok=True)
 
     def stats(self, tenant: str) -> Stats:
         names.tenant(tenant)
         q = self.db.execute
         commits = q("SELECT COUNT(*) FROM commits WHERE tenant = ?", (tenant,)).fetchone()[0]
         manifests = q("SELECT COUNT(*) FROM manifests WHERE tenant = ?", (tenant,)).fetchone()[0]
-        chunks, physical = q(
-            "SELECT COUNT(*), COALESCE(SUM(nbytes), 0) FROM chunks WHERE tenant = ?", (tenant,)
+        chunks, physical, raw = q(
+            "SELECT COUNT(*), COALESCE(SUM(stored_bytes), 0), COALESCE(SUM(nbytes), 0) "
+            "FROM chunks WHERE tenant = ?",
+            (tenant,),
         ).fetchone()
         logical = q(
-            "SELECT COALESCE(SUM(c.nbytes), 0) FROM manifest_tensors t "
-            "JOIN chunks c ON c.tenant = t.tenant AND c.hash = t.chunk_hash WHERE t.tenant = ?",
-            (tenant,),
+            "SELECT COALESCE(SUM(nbytes), 0) FROM manifest_tensors WHERE tenant = ?", (tenant,)
         ).fetchone()[0]
-        return Stats(commits, manifests, chunks, physical, logical)
+        return Stats(commits, manifests, chunks, physical, logical, raw)
 
     # -- analysis -----------------------------------------------------------
 
-    def diff(self, tenant: str, a: str, b: str, probe_set: str | None = None) -> Diff:
+    def diff(
+        self, tenant: str, a: str, b: str, probe_set: str | None = None, threshold: float | None = None
+    ) -> Diff:
         ca, cb = self.resolve(tenant, a), self.resolve(tenant, b)
+        threshold = self.unobserved_threshold if threshold is None else threshold
+
+        # Identical block runs mean identical bytes; skip loading those tensors.
+        ma, mb = self.manifest(tenant, ca.manifest_id), self.manifest(tenant, cb.manifest_id)
+        same: set[str] = set()
+        if ma.kind == "leaf" and mb.kind == "leaf":
+            ba, bb = self.tensor_blocks(tenant, ma.id), self.tensor_blocks(tenant, mb.id)
+            same = {n for n in ba if n in bb and ba[n] == bb[n]}
+
         ta = self._materialise(tenant, ca.manifest_id, viewer=tenant)
         tb = self._materialise(tenant, cb.manifest_id, viewer=tenant)
 
@@ -578,7 +826,11 @@ class Store:
         den = 0.0
         worst = 0.0
         for name in shared:
-            x = ta[name].astype(np.float32)
+            x = ta[name]
+            if name in same:
+                den += float(np.sum(x.astype(np.float32) ** 2))
+                continue
+            x = x.astype(np.float32)
             y = tb[name].astype(np.float32)
             if x.shape != y.shape or not np.array_equal(x, y):
                 changed.append(name)
@@ -591,12 +843,18 @@ class Store:
         relative = float(np.sqrt(num) / np.sqrt(den)) if den > 0 else (1.0 if num > 0 else 0.0)
 
         probes_changed = probes_total = None
+        similarity: float | None = None
         if probe_set is not None:
             fa = self._fingerprint(tenant, ca.id, probe_set)
             fb = self._fingerprint(tenant, cb.id, probe_set)
             if fa is not None and fb is not None and len(fa) == len(fb):
                 probes_total = len(fa)
-                probes_changed = sum(1 for x, y in zip(fa, fb, strict=True) if x != y)
+                moved = [(x, y) for x, y in zip(fa, fb, strict=True) if x != y]
+                probes_changed = len(moved)
+                if moved:
+                    similarity = sum(difflib.SequenceMatcher(None, x, y).ratio() for x, y in moved) / len(
+                        moved
+                    )
 
         return Diff(
             ca.id,
@@ -607,9 +865,11 @@ class Store:
             len(shared),
             relative,
             worst,
+            threshold,
             probe_set,
             probes_changed,
             probes_total,
+            similarity,
         )
 
     # -- fingerprints -------------------------------------------------------
@@ -688,8 +948,10 @@ class Store:
             for table in (
                 "fingerprints",
                 "refs",
+                "reflog",
                 "commits",
                 "manifest_inputs",
+                "tensor_blocks",
                 "manifest_tensors",
                 "manifests",
                 "chunks",
@@ -701,7 +963,7 @@ class Store:
             self._tombstone(db, tenant, "commit", commits, reason, now, attestation)
             self._tombstone(db, tenant, "manifest", manifests, reason, now, attestation)
             self._tombstone(db, tenant, "chunk", chunks, reason, now, attestation)
-            proof = Proof(
+            proof = self._proof(
                 tenant,
                 reason,
                 now,
@@ -715,7 +977,9 @@ class Store:
             )
             self._store_proof(db, proof)
         freed = self.chunks.delete_tenant(tenant)
-        proof = Proof(**{**asdict(proof), "bytes_freed": freed})
+        shutil.rmtree(self.root / "cache" / tenant, ignore_errors=True)
+        self._drop_cache(broken)
+        proof = self._proof(**{**asdict(proof), "bytes_freed": freed, "signature": None})
         with self._tx() as db:
             self._store_proof(db, proof)
         return proof
@@ -748,8 +1012,8 @@ class Store:
             orphaned = [
                 r["chunk_hash"]
                 for r in q(
-                    "SELECT chunk_hash FROM manifest_tensors WHERE tenant = ? AND manifest_id = ? "
-                    "AND chunk_hash NOT IN (SELECT chunk_hash FROM manifest_tensors "
+                    "SELECT DISTINCT chunk_hash FROM tensor_blocks WHERE tenant = ? AND manifest_id = ? "
+                    "AND chunk_hash NOT IN (SELECT chunk_hash FROM tensor_blocks "
                     "WHERE tenant = ? AND manifest_id != ?)",
                     (tenant, commit.manifest_id, tenant, commit.manifest_id),
                 )
@@ -765,19 +1029,18 @@ class Store:
 
         manifests = [commit.manifest_id] if drop_manifest else []
         attestation = _attest(tenant, [commit.id], manifests, orphaned, now)
+        moved_refs = [
+            r["name"]
+            for r in q("SELECT name FROM refs WHERE tenant = ? AND commit_id = ?", (tenant, commit.id))
+        ]
 
         with self._tx() as db:
             db.execute(
                 "UPDATE commits SET parent_id = ? WHERE tenant = ? AND parent_id = ?",
                 (commit.parent_id, tenant, commit.id),
             )
-            if commit.parent_id:
-                db.execute(
-                    "UPDATE refs SET commit_id = ? WHERE tenant = ? AND commit_id = ?",
-                    (commit.parent_id, tenant, commit.id),
-                )
-            else:
-                db.execute("DELETE FROM refs WHERE tenant = ? AND commit_id = ?", (tenant, commit.id))
+            for ref in moved_refs:
+                self._move_ref(db, tenant, ref, commit.id, commit.parent_id, "forget", now)
             db.execute("DELETE FROM commits WHERE tenant = ? AND id = ?", (tenant, commit.id))
             if drop_manifest:
                 db.execute("DELETE FROM manifests WHERE tenant = ? AND id = ?", (tenant, commit.manifest_id))
@@ -793,7 +1056,7 @@ class Store:
             self._tombstone(db, tenant, "manifest", manifests, reason, now, attestation)
             self._tombstone(db, tenant, "chunk", orphaned, reason, now, attestation)
             freed = sum(self.chunks.delete(tenant, h) for h in orphaned)
-            proof = Proof(
+            proof = self._proof(
                 tenant,
                 reason,
                 now,
@@ -806,10 +1069,26 @@ class Store:
                 attestation,
             )
             self._store_proof(db, proof)
+        if drop_manifest:
+            self._cache_path(tenant, commit.manifest_id).unlink(missing_ok=True)
+        self._drop_cache(broken)
         return proof
 
+    def _proof(self, *args: Any, **kwargs: Any) -> Proof:
+        proof = Proof(*args, **kwargs)
+        if self._signing_key and not proof.signature:
+            proof = Proof(**{**asdict(proof), "signature": self._sign(proof.attestation)})
+        return proof
+
+    def _sign(self, attestation: str) -> str:
+        if self._signing_key is None:
+            raise RuntimeError("no signing key configured")
+        return hmac.new(self._signing_key, attestation.encode(), hashlib.sha256).hexdigest()
+
     def proof(self, attestation: str) -> Proof:
-        row = self.db.execute("SELECT body FROM proofs WHERE attestation = ?", (attestation,)).fetchone()
+        row = self.db.execute(
+            "SELECT body, signature FROM proofs WHERE attestation = ?", (attestation,)
+        ).fetchone()
         if row is None:
             raise LookupError(f"no proof with attestation {attestation[:12]}")
         body = json.loads(row["body"])
@@ -824,13 +1103,16 @@ class Store:
             broken_composites=tuple(body["broken_composites"]),
             revoked_grants=tuple(body["revoked_grants"]),
             attestation=str(body["attestation"]),
+            signature=row["signature"],
         )
 
     def verify(self, proof: Proof | str) -> list[str]:
         """Re-check a proof against the store. Empty list means it holds.
 
         Takes the proof or its attestation; the attestation alone is enough to
-        verify from another process, which is the point of storing it.
+        verify from another process, which is the point of storing it. With a
+        signing key configured, the signature is checked too, and an unsigned
+        proof is reported.
         """
         if isinstance(proof, str):
             proof = self.proof(proof)
@@ -844,9 +1126,9 @@ class Store:
                 problems.append(f"manifest {mid[:12]} still present")
         for h in proof.chunks:
             if q("SELECT 1 FROM chunks WHERE tenant = ? AND hash = ?", (proof.tenant, h)).fetchone():
-                problems.append(f"chunk {h[:12]} still indexed")
+                problems.append(f"block {h[:12]} still indexed")
             if self.chunks.exists(proof.tenant, h):
-                problems.append(f"chunk {h[:12]} still on disk")
+                problems.append(f"block {h[:12]} still in the backend")
         for kind, ids in (("commit", proof.commits), ("manifest", proof.manifests), ("chunk", proof.chunks)):
             for item in ids:
                 row = q(
@@ -860,14 +1142,21 @@ class Store:
         )
         if expected != proof.attestation:
             problems.append("attestation does not match the proof's own contents")
+        if self._signing_key:
+            if not proof.signature:
+                problems.append("proof is unsigned but a signing key is configured")
+            elif not hmac.compare_digest(proof.signature, self._sign(proof.attestation)):
+                problems.append("signature does not match the configured key")
+        elif proof.signature:
+            problems.append("proof is signed but no signing key is configured to check it")
         return problems
 
     def gc(self, tenant: str) -> int:
-        """Drop chunks no manifest references. Returns bytes freed."""
+        """Drop blocks no tensor references and cache entries with no manifest. Returns bytes freed."""
         names.tenant(tenant)
         rows = self.db.execute(
             "SELECT hash FROM chunks WHERE tenant = ? AND hash NOT IN "
-            "(SELECT chunk_hash FROM manifest_tensors WHERE tenant = ?)",
+            "(SELECT chunk_hash FROM tensor_blocks WHERE tenant = ?)",
             (tenant, tenant),
         ).fetchall()
         freed = 0
@@ -875,6 +1164,13 @@ class Store:
             for r in rows:
                 db.execute("DELETE FROM chunks WHERE tenant = ? AND hash = ?", (tenant, r["hash"]))
                 freed += self.chunks.delete(tenant, r["hash"])
+        cache_dir = self.root / "cache" / tenant
+        if cache_dir.exists():
+            live = {r["id"] for r in self.db.execute("SELECT id FROM manifests WHERE tenant = ?", (tenant,))}
+            for file in cache_dir.glob("*.safetensors"):
+                if file.stem not in live:
+                    freed += file.stat().st_size
+                    file.unlink()
         return freed
 
     # -- integrity ----------------------------------------------------------
@@ -882,32 +1178,46 @@ class Store:
     def fsck(self, tenant: str | None = None, verify_bytes: bool = True) -> list[str]:
         """Check the store's invariants. Empty list means it is consistent.
 
-        With `verify_bytes`, every chunk is re-hashed; that reads every byte and
-        is the check that catches silent disk corruption. Without it, only the
-        graph is checked.
+        With `verify_bytes`, every block is re-read and re-hashed; that is the
+        check that catches silent corruption. Without it, only the graph is
+        checked.
         """
         q = self.db.execute
         scope = "WHERE tenant = ?" if tenant else ""
         params: tuple[Any, ...] = (tenant,) if tenant else ()
         problems: list[str] = []
 
-        for r in q(f"SELECT tenant, hash, dtype, shape FROM chunks {scope}", params):  # noqa: S608
+        for r in q(f"SELECT tenant, hash, encoding, nbytes FROM chunks {scope}", params):  # noqa: S608
             if not self.chunks.exists(r["tenant"], r["hash"]):
-                problems.append(f"{r['tenant']}: chunk {r['hash'][:12]} indexed but missing on disk")
-            elif verify_bytes and not self.chunks.verify(
-                r["tenant"], r["hash"], r["dtype"], json.loads(r["shape"])
+                problems.append(f"{r['tenant']}: block {r['hash'][:12]} indexed but missing from the backend")
+            elif verify_bytes and not self.chunks.verify_block(
+                r["tenant"], r["hash"], r["encoding"], r["nbytes"]
             ):
-                problems.append(f"{r['tenant']}: chunk {r['hash'][:12]} does not hash to its name")
+                problems.append(f"{r['tenant']}: block {r['hash'][:12]} does not hash to its name")
 
         for r in q(
-            f"SELECT t.tenant, t.manifest_id, t.name FROM manifest_tensors t "  # noqa: S608
-            f"LEFT JOIN chunks c ON c.tenant = t.tenant AND c.hash = t.chunk_hash "
-            f"{scope.replace('tenant', 't.tenant')} {'AND' if scope else 'WHERE'} c.hash IS NULL",
+            f"SELECT b.tenant, b.manifest_id, b.name FROM tensor_blocks b "  # noqa: S608
+            f"LEFT JOIN chunks c ON c.tenant = b.tenant AND c.hash = b.chunk_hash "
+            f"{scope.replace('tenant', 'b.tenant')} {'AND' if scope else 'WHERE'} c.hash IS NULL",
             params,
         ):
             problems.append(
-                f"{r['tenant']}: manifest {r['manifest_id'][:12]} tensor {r['name']!r} has no chunk"
+                f"{r['tenant']}: manifest {r['manifest_id'][:12]} tensor {r['name']!r} has a missing block"
             )
+
+        for r in q(
+            f"SELECT t.tenant, t.manifest_id, t.name, t.nbytes, "  # noqa: S608
+            f"COALESCE((SELECT SUM(c.nbytes) FROM tensor_blocks b JOIN chunks c "
+            f"ON c.tenant = b.tenant AND c.hash = b.chunk_hash "
+            f"WHERE b.tenant = t.tenant AND b.manifest_id = t.manifest_id AND b.name = t.name), 0) AS have "
+            f"FROM manifest_tensors t {scope.replace('tenant', 't.tenant')}",
+            params,
+        ):
+            if r["have"] != r["nbytes"]:
+                problems.append(
+                    f"{r['tenant']}: manifest {r['manifest_id'][:12]} tensor {r['name']!r} "
+                    f"has {r['have']} bytes of blocks for {r['nbytes']} declared"
+                )
 
         for r in q(
             f"SELECT r.tenant, r.name FROM refs r "  # noqa: S608
@@ -948,10 +1258,17 @@ class Store:
         return problems
 
     def _store_proof(self, db: sqlite3.Connection, proof: Proof) -> None:
+        body = {k: v for k, v in asdict(proof).items() if k != "signature"}
         db.execute(
-            "INSERT INTO proofs (attestation, tenant, body, created_at) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT (attestation) DO UPDATE SET body = excluded.body",
-            (proof.attestation, proof.tenant, json.dumps(asdict(proof), sort_keys=True), proof.deleted_at),
+            "INSERT INTO proofs (attestation, tenant, body, signature, created_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (attestation) DO UPDATE SET body = excluded.body, signature = excluded.signature",
+            (
+                proof.attestation,
+                proof.tenant,
+                json.dumps(body, sort_keys=True),
+                proof.signature,
+                proof.deleted_at,
+            ),
         )
 
     def _tombstone(

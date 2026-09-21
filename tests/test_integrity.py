@@ -70,7 +70,7 @@ def test_fsck_catches_a_chunk_missing_from_disk(store, rng):
     store.commit("t", adapter(rng), message="v1")
     row = store.db.execute("SELECT hash FROM chunks WHERE tenant = 't' LIMIT 1").fetchone()
     store.chunks.path("t", row["hash"]).unlink()
-    assert any("missing on disk" in p for p in store.fsck("t"))
+    assert any("missing from the backend" in p for p in store.fsck("t"))
 
 
 def test_fsck_reports_a_broken_view(store, rng):

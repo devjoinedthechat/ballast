@@ -35,9 +35,11 @@ def test_mismatched_tensor_sets_are_refused():
         merging.linear([{"w": np.zeros(2)}, {"v": np.zeros(2)}], [1, 1])
 
 
-def test_record_only_methods_refuse_to_resolve():
+@pytest.mark.parametrize("method", ["slerp", "dare_ties", "dare_linear", "passthrough"])
+def test_record_only_methods_refuse_to_resolve(method):
+    """A method that is not implemented must not quietly run as one that is."""
     with pytest.raises(NotImplementedError, match="recorded for provenance"):
-        merging.resolve("slerp", [{"w": np.zeros(2)}], [1.0])
+        merging.resolve(method, [{"w": np.zeros(2)}], [1.0])
 
 
 def test_a_merge_is_a_view_that_resolves_at_checkout(store, rng):

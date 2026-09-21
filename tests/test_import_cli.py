@@ -74,7 +74,7 @@ def test_cli_commit_log_diff_checkout_forget(tmp_path, rng, capsys):
     assert (tmp_path / "out" / "adapter_model.safetensors").exists()
 
     assert main(["--root", root, "--tenant", "t", "stats"]) == 0
-    assert "9 chunks" in capsys.readouterr().out
+    assert "9 blocks" in capsys.readouterr().out
 
     assert main(["--root", root, "--tenant", "t", "forget", "--reason", "test"]) == 0
     assert "verified" in capsys.readouterr().out

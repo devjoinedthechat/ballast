@@ -20,7 +20,7 @@ def test_a_commit_that_changes_one_tensor_stores_one_chunk(store, rng):
     store.commit("t", scaled(a, "layers.2.lora_A.weight", 1.1), message="v2")
     s = store.stats("t")
     assert s.chunks == len(a) + 1
-    assert s.dedup_ratio == pytest.approx(2 * sum(t.nbytes for t in a.values()) / s.physical_bytes)
+    assert s.dedup_ratio == pytest.approx(2 * sum(t.nbytes for t in a.values()) / s.raw_bytes)
 
 
 def test_checkout_returns_the_bytes_that_went_in(store, rng):
