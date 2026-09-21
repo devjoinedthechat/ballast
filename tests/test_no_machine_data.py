@@ -52,17 +52,31 @@ def test_no_machine_data_in(path: Path):
 
 
 def test_the_patterns_catch_what_they_are_for():
-    """A guard that never fires is not a guard."""
+    """A guard that never fires is not a guard.
+
+    The samples are assembled rather than written out, because this file is
+    tracked and the guard reads it: a literal example would be caught as the
+    thing it is an example of.
+    """
     samples = {
-        "a home directory": "/Users/someone/ballast",
-        "a macOS temporary directory": "/var/folders/d6/0a1b2c3d4e5f/T/x",
-        "a private temporary directory": "/private/tmp/ballast-verify-abc",
-        "a local checkout path": "/Desktop/ballast",
+        "a home directory": "/" + "Users/someone/ballast",
+        "a macOS temporary directory": "/var/" + "folders/d6/0a1b2c3d4e5f/T/x",
+        "a private temporary directory": "/private/" + "tmp/ballast-verify-abc",
+        "a local checkout path": "/" + "Desktop/ballast",
     }
     for what, sample in samples.items():
         assert LEAKS[what].search(sample), what
 
 
 def test_a_documentation_placeholder_is_not_a_leak():
-    """`/home/<user>/…` in an example is deliberate and must stay allowed."""
-    assert LEAKS["a home directory"].search("/home/<user>/models") is None
+    """An angle-bracket placeholder in an example is deliberate and stays allowed."""
+    assert LEAKS["a home directory"].search("/" + "home/<user>/models") is None
+
+
+def test_the_guard_reads_what_git_tracks():
+    """A file not yet added is not scanned, so run this after staging.
+
+    The guard's own first version passed locally and failed in CI for exactly
+    that reason.
+    """
+    assert Path(__file__) in tracked_text_files()
