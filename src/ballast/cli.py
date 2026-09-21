@@ -166,7 +166,29 @@ def cmd_merge(store: Store, a: argparse.Namespace) -> int:
         inputs.append((spec, float(weight) if weight else 1.0))
     try:
         commit = store.merge(
-            a.tenant, a.method, inputs, message=a.message, ref=a.ref, density=a.density, strict=not a.union
+            a.tenant,
+            a.method,
+            inputs,
+            message=a.message,
+            ref=a.ref,
+            density=a.density,
+            strict=a.strict,
+            seed=a.seed,
+            t=a.t,
+            normalize=a.normalize,
+            extra={
+                key: value
+                for key, value in (
+                    ("row_wise", a.row_wise),
+                    ("flatten", a.flatten),
+                    ("filter_wise", a.filter_wise),
+                    ("select_topk", a.select_topk),
+                )
+                if value
+            }
+            or None,
+            gamma=a.gamma,
+            epsilon=a.epsilon,
         )
     except NotGranted as exc:
         print(f"refused: {exc}", file=sys.stderr)
@@ -326,9 +348,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     s.add_argument("inputs", nargs="+")
     s.add_argument("--method", default="linear")
-    s.add_argument("--density", type=float)
+    s.add_argument("--density", type=float, help="the share of entries a sparsifying method keeps")
+    s.add_argument("--t", type=float, help="slerp: how far to travel from the first input to the second")
+    s.add_argument("--seed", type=int, help="pin the draw a random method makes; one is chosen otherwise")
     s.add_argument(
-        "--union", action="store_true", help="merge the union of tensors; absent ones count as zero"
+        "--normalize",
+        action=argparse.BooleanOptionalAction,
+        help="divide by the weights that agreed; on for ties, off for dare",
+    )
+    s.add_argument("--gamma", type=float, help="breadcrumbs: the share of largest entries dropped")
+    s.add_argument("--epsilon", type=float, help="della: how far the keep probability swings by rank")
+    s.add_argument("--select-topk", type=float, help="sce: the share of entries kept, by disagreement")
+    s.add_argument("--row-wise", action="store_true", help="nuslerp: interpolate rows, not the tensor")
+    s.add_argument("--flatten", action="store_true", help="nuslerp: treat the tensor as one vector")
+    s.add_argument("--filter-wise", action="store_true", help="model_stock: one angle per row")
+    s.add_argument(
+        "--strict",
+        action="store_true",
+        help="require every input to carry the same tensors; by default an absent one counts as zero",
     )
     s.add_argument("-m", "--message", required=True)
     s.add_argument("--ref", default="main")
@@ -421,6 +458,19 @@ def main(argv: list[str] | None = None) -> int:
     }
     try:
         return handlers[a.command](store, a)
+    except LookupError as exc:
+        # An unknown ref or commit is a mistake at the keyboard, not a bug.
+        print(f"{exc}", file=sys.stderr)
+        return 2
+    except BrokenView as exc:
+        print(f"cannot resolve: {exc}", file=sys.stderr)
+        return 2
+    except NotGranted as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 3
+    except ValueError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 1
     finally:
         store.close()
 

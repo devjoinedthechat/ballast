@@ -87,18 +87,36 @@ def test_revoking_a_grant_drops_the_grantees_cached_view(store, rng):
     assert not cached.exists()
 
 
-def test_union_merge_treats_absent_tensors_as_zero_and_strict_refuses(store, rng):
+def test_deltas_that_touch_different_tensors_merge_by_default(store, rng):
+    """Two fine-tunes of one base rarely touch the same weights.
+
+    Refusing that by default would refuse the ordinary case, so the union is
+    the default and a weight an input never changed counts as a change of zero.
+    """
     a = adapter(rng, layers=2)
     b = {k: v for k, v in adapter(rng, layers=3).items() if ".2." in k}  # only layer 2
     c1 = store.commit("t", a, message="a", base_model="b")
     c2 = store.commit("t", b, message="b", base_model="b")
-    with pytest.raises(ValueError, match="strict=False"):
-        store.checkout("t", store.merge("t", "linear", [(c1.id, 1.0), (c2.id, 1.0)], message="strict").id)
-    m = store.merge("t", "linear", [(c1.id, 1.0), (c2.id, 1.0)], message="union", strict=False, ref="u")
+
+    m = store.merge("t", "linear", [(c1.id, 1.0), (c2.id, 1.0)], message="union", ref="u")
     out = store.checkout("t", m.id)
     assert set(out) == set(a) | set(b)
     name = "layers.0.lora_A.weight"
     assert np.allclose(out[name].astype(np.float32), a[name].astype(np.float32), rtol=1e-2)
+
+    strict = store.merge("t", "linear", [(c1.id, 1.0), (c2.id, 1.0)], message="strict", ref="s", strict=True)
+    with pytest.raises(BrokenView, match="cannot resolve"):
+        store.checkout("t", strict.id)
+
+
+def test_a_view_records_which_rule_it_was_made_under(store, rng):
+    """So a view resolved later does not depend on what the default was then."""
+    c1 = store.commit("t", adapter(rng), message="a", base_model="b")
+    c2 = store.commit("t", adapter(rng), message="b", base_model="b")
+    loose = store.merge("t", "linear", [(c1.id, 1.0), (c2.id, 1.0)], message="u", ref="u")
+    tight = store.merge("t", "linear", [(c1.id, 1.0), (c2.id, 1.0)], message="s", ref="s", strict=True)
+    assert store.manifest("t", loose.manifest_id).config["strict"] is False
+    assert store.manifest("t", tight.manifest_id).config["strict"] is True
 
 
 def test_the_unobserved_threshold_is_configurable(store, rng):

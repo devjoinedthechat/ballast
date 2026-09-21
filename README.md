@@ -16,10 +16,9 @@
 <p align="center">
   <a href="https://github.com/devjoinedthechat/ballast/actions/workflows/ci.yml"><img src="https://github.com/devjoinedthechat/ballast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%20%7C%203.12%20%7C%203.14-blue" alt="Python 3.10 | 3.12 | 3.14">
-  <img src="https://img.shields.io/badge/tests-243-brightgreen" alt="243 tests">
+  <img src="https://img.shields.io/badge/tests-252-brightgreen" alt="252 tests">
   <img src="https://img.shields.io/badge/verified%20against-mergekit%20%C2%B7%20PEFT%20%C2%B7%20Postgres-2e7d32" alt="Verified against mergekit, PEFT and Postgres">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0">
-  <img src="https://img.shields.io/badge/status-pre--alpha-orange" alt="Status: pre-alpha">
 </p>
 
 <p align="center">
@@ -33,7 +32,8 @@
   <a href="#serving">Serving</a> ·
   <a href="#cli">CLI</a> ·
   <a href="#what-is-verified">Verification</a> ·
-  <a href="docs/walkthrough.md">Walkthrough</a>
+  <a href="docs/walkthrough.md">Walkthrough</a> ·
+  <a href="docs/scope.md">Scope</a>
 </p>
 
 ---
@@ -169,7 +169,10 @@ store.merge("acme", "ties", [("support", 0.6), ("finance", 0.4)], density=0.5, m
 ```
 
 Nothing is computed until `checkout`, and the result is cached until an input is
-deleted or a grant revoked.
+deleted or a grant revoked. Inputs are merged over the union of their tensors,
+treating one an input lacks as zero — two fine-tunes of a base rarely touch the
+same weights, and a weight one of them never changed is a change of zero. Pass
+`--strict` when they are meant to match and a mismatch should be an error.
 
 | resolves | what it does |
 | --- | --- |
@@ -395,27 +398,6 @@ in it passes:
 - **`delta` → view → `apply` reproduces mergekit's output model** directory, and
   transformers loads it.
 
-## Project status
-
-Pre-alpha. The schema is versioned and migrates; the Python API is not yet stable.
-Not published to an index yet, so install from a checkout.
-
-What is not there:
-
-- **A live vLLM in the tests.** `sync-vllm` drives vLLM's runtime LoRA endpoints
-  and is tested against a stub transport, which checks the conversation — the
-  requests made and how each reply is handled — but not vLLM's own behaviour.
-  vLLM is CUDA-first and is not installed in CI.
-- **Three merge methods.** `arcee_fusion`, `karcher` and `nearswap` are read and
-  recorded, and refuse rather than approximate. So does the `slices` form, which
-  composes layer ranges rather than whole deltas.
-- **Authentication beyond bearer tokens.** Scoped static tokens are enough for a
-  fleet behind a gateway and are not an identity system.
-- **A systems-language core.** `chunks.py` is one module with a narrow interface
-  and nothing above it touches a backend directly, so it is the piece to rewrite
-  when a single node stops being enough. There is no evidence it is the
-  bottleneck yet, so it has not been.
-
 ## Install
 
 ```
@@ -432,10 +414,14 @@ The core has four dependencies — numpy, ml_dtypes, blake3 and zstandard — an
 checks that a bare install commits, reads back and passes `fsck` without any of
 the extras.
 
-## Contributing and security
+## Documentation
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout and what a change needs, and
-[SECURITY.md](SECURITY.md) for the trust boundary.
+- [Walkthrough](docs/walkthrough.md) — two tenants, a grant, a revocation, a deletion
+- [Scope](docs/scope.md) — what this does not do, and why
+- [Adapters](docs/adapters.md) — the contract for a storage backend
+- [Contributing](CONTRIBUTING.md) — the layout, and what a change needs
+- [Security](SECURITY.md) — the trust boundary
+- [Changelog](CHANGELOG.md)
 
 ## License
 

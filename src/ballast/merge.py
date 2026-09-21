@@ -64,7 +64,7 @@ DOT_THRESHOLD = 0.9995
 
 
 def linear(
-    inputs: Sequence[dict[str, np.ndarray]], weights: Sequence[float], strict: bool = True
+    inputs: Sequence[dict[str, np.ndarray]], weights: Sequence[float], strict: bool = False
 ) -> dict[str, np.ndarray]:
     """Weighted sum. Task arithmetic over deltas is the same operation."""
     return merge_all("linear", inputs, weights, Params(), strict)
@@ -115,7 +115,7 @@ def ties(
     inputs: Sequence[dict[str, np.ndarray]],
     weights: Sequence[float],
     density: float = DEFAULT_DENSITY,
-    strict: bool = True,
+    strict: bool = False,
     normalize: bool = True,
     lambda_: float = 1.0,
 ) -> dict[str, np.ndarray]:
@@ -136,7 +136,7 @@ def dare_ties(
     inputs: Sequence[dict[str, np.ndarray]],
     weights: Sequence[float],
     density: float = DEFAULT_DENSITY,
-    strict: bool = True,
+    strict: bool = False,
     seed: int = 0,
     normalize: bool = False,
     lambda_: float = 1.0,
@@ -161,7 +161,7 @@ def dare_linear(
     inputs: Sequence[dict[str, np.ndarray]],
     weights: Sequence[float],
     density: float = DEFAULT_DENSITY,
-    strict: bool = True,
+    strict: bool = False,
     seed: int = 0,
     lambda_: float = 1.0,
 ) -> dict[str, np.ndarray]:
@@ -175,7 +175,7 @@ def breadcrumbs(
     inputs: Sequence[dict[str, np.ndarray]],
     weights: Sequence[float],
     density: float = DEFAULT_DENSITY,
-    strict: bool = True,
+    strict: bool = False,
     gamma: float = DEFAULT_GAMMA,
     elect: bool = False,
     lambda_: float = 1.0,
@@ -195,7 +195,7 @@ def della(
     inputs: Sequence[dict[str, np.ndarray]],
     weights: Sequence[float],
     density: float = DEFAULT_DENSITY,
-    strict: bool = True,
+    strict: bool = False,
     seed: int = 0,
     epsilon: float = DEFAULT_EPSILON,
     elect: bool = True,
@@ -357,7 +357,7 @@ def merge_all(
     inputs: Sequence[dict[str, np.ndarray]],
     weights: Sequence[float],
     params: Params,
-    strict: bool = True,
+    strict: bool = False,
 ) -> dict[str, np.ndarray]:
     """Every tensor at once, for callers that already hold the inputs."""
     names = _union(inputs, strict)
@@ -369,9 +369,10 @@ def merge_all(
 def _union(inputs: Sequence[dict[str, np.ndarray]], strict: bool) -> list[str]:
     """The tensors to merge.
 
-    Strict requires every input to carry the same ones. Non-strict takes the
-    union and treats a tensor an input lacks as zero, which is what two adapters
-    over the same base with different target modules need.
+    The union by default, treating a tensor an input lacks as zero: two deltas
+    over the same base rarely touch the same weights, and a weight one of them
+    never changed is a change of zero. Strict demands they carry exactly the
+    same tensors, which is a useful check when they are meant to.
     """
     if not inputs:
         raise ValueError("a merge needs at least one input")
@@ -665,7 +666,7 @@ def resolve(
     inputs: Sequence[dict[str, np.ndarray]],
     weights: Sequence[float],
     density: float | None = None,
-    strict: bool = True,
+    strict: bool = False,
     seed: int | None = None,
     normalize: bool | None = None,
     lambda_: float = 1.0,

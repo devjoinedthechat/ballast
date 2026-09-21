@@ -77,6 +77,12 @@ def export(
     """
     commit = store.resolve(tenant, spec)
     manifest = store.manifest(tenant, commit.manifest_id)
+    # Checked even when the directory is already there. An export is a copy
+    # outside the store, and nothing stops it outliving what it was copied from:
+    # without this, a delta that was forgotten, or a grant that was revoked,
+    # would go on being served from the last export of it. Resolving the graph
+    # reads no tensors, so the check costs a few queries.
+    store.specs(tenant, commit.id)
     path = Path(root) / tenant / commit.id
     reused = path.joinpath(peft_io.WEIGHTS).exists() and not refresh
 

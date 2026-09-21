@@ -226,7 +226,13 @@ class Proof:
 
 
 class BrokenView(LookupError):
-    """A composite whose input has been deleted, or whose grant was revoked."""
+    """A view that cannot produce tensors.
+
+    One condition with several causes — an input deleted, a grant revoked, a
+    strict view whose inputs stopped agreeing — because to everything that
+    consumes a view they are the same event: this one cannot be served, name it
+    and carry on with the others.
+    """
 
 
 class NotGranted(PermissionError):
@@ -430,7 +436,7 @@ class Store:
         message: str,
         ref: str = DEFAULT_REF,
         density: float | None = None,
-        strict: bool = True,
+        strict: bool = False,
         seed: int | None = None,
         normalize: bool | None = None,
         lambda_: float = 1.0,
@@ -448,8 +454,14 @@ class Store:
         result out, and only for as long as every input still exists.
 
         An input is a ref or commit id in this tenant, or `other:ref` for a
-        manifest another tenant has granted. `strict=False` merges the union of
-        the inputs' tensors, treating a tensor an input lacks as zero.
+        manifest another tenant has granted.
+
+        Inputs are merged over the union of their tensors, treating one an input
+        lacks as zero. That is the right reading for deltas, which is what this
+        stores: two fine-tunes of the same base rarely touch the same weights,
+        and a tensor one of them never changed is a change of zero. `strict=True`
+        demands they carry exactly the same tensors, which is a useful check when
+        they are meant to.
 
         A method that draws a random mask gets a seed, generated here if none is
         given, and stored in the view. Without it the same recipe would resolve
@@ -480,8 +492,9 @@ class Store:
         config: dict[str, Any] = {"method": method}
         if density is not None:
             config["density"] = density
-        if not strict:
-            config["strict"] = False
+        # Written either way. A view resolved years later must not depend on
+        # what the default happened to be when it was recorded.
+        config["strict"] = bool(strict)
         if normalize is not None:
             config["normalize"] = bool(normalize)
         if lambda_ != 1.0:
@@ -800,20 +813,23 @@ class Store:
         except BrokenView as exc:
             raise BrokenView(f"composite {manifest_id[:12]} cannot resolve: {exc}") from exc
         weights = [w for _, _, w in parts]
-        out = merging.resolve(
-            manifest.config["method"],
-            resolved,
-            weights,
-            manifest.config.get("density"),
-            manifest.config.get("strict", True),
-            manifest.config.get("seed"),
-            manifest.config.get("normalize"),
-            manifest.config.get("lambda", 1.0),
-            manifest.config.get("gamma", merging.DEFAULT_GAMMA),
-            manifest.config.get("epsilon", merging.DEFAULT_EPSILON),
-            manifest.config.get("t"),
-            {k: v for k, v in manifest.config.items() if k in merging.EXTRA_KEYS},
-        )
+        try:
+            out = merging.resolve(
+                manifest.config["method"],
+                resolved,
+                weights,
+                manifest.config.get("density"),
+                manifest.config.get("strict", True),
+                manifest.config.get("seed"),
+                manifest.config.get("normalize"),
+                manifest.config.get("lambda", 1.0),
+                manifest.config.get("gamma", merging.DEFAULT_GAMMA),
+                manifest.config.get("epsilon", merging.DEFAULT_EPSILON),
+                manifest.config.get("t"),
+                {k: v for k, v in manifest.config.items() if k in merging.EXTRA_KEYS},
+            )
+        except ValueError as exc:
+            raise BrokenView(f"composite {manifest_id[:12]} cannot resolve: {exc}") from exc
         if self.cache_views:
             cached.parent.mkdir(parents=True, exist_ok=True)
             tmp = cached.with_suffix(".tmp")
@@ -901,7 +917,10 @@ class Store:
             per_input = [self._specs_of(owner, mid, viewer) for owner, mid, _ in parts]
         except BrokenView as exc:
             raise BrokenView(f"composite {manifest_id[:12]} cannot resolve: {exc}") from exc
-        names = self._merge_names(per_input, strict)
+        try:
+            names = self._merge_names(per_input, strict)
+        except ValueError as exc:
+            raise BrokenView(f"composite {manifest_id[:12]} cannot resolve: {exc}") from exc
 
         def produce(name: str) -> np.ndarray:
             arrays = [
@@ -910,7 +929,7 @@ class Store:
             ]
             try:
                 return merging.merge_tensor(manifest.config["method"], name, arrays, weights, params)
-            except BrokenView as exc:
+            except (BrokenView, ValueError) as exc:
                 raise BrokenView(f"composite {manifest_id[:12]} cannot resolve: {exc}") from exc
 
         if not cache:
@@ -970,7 +989,10 @@ class Store:
             per_input = [self._specs_of(owner, mid, tenant) for owner, mid, _ in parts]
         except BrokenView as exc:
             raise BrokenView(f"composite {manifest_id[:12]} cannot resolve: {exc}") from exc
-        names = self._merge_names(per_input, manifest.config.get("strict", True))
+        try:
+            names = self._merge_names(per_input, manifest.config.get("strict", True))
+        except ValueError as exc:
+            raise BrokenView(f"composite {manifest_id[:12]} cannot resolve: {exc}") from exc
         return self._merged_specs(per_input, names)
 
     def _tensor_of(self, tenant: str, manifest_id: str, name: str, viewer: str) -> np.ndarray:

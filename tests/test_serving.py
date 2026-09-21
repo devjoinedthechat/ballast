@@ -273,3 +273,37 @@ def test_a_broken_view_is_skipped_rather_than_failing_the_sync(store, rng, tmp_p
 def test_unloading_something_already_gone_is_not_an_error(store, tmp_path):
     stub = StubVLLM()
     runtime(stub).unload("never-loaded")
+
+
+def test_an_export_stops_being_served_once_its_input_is_forgotten(store, rng, tmp_path):
+    """An export is a copy outside the store and can outlive what it came from.
+
+    Without re-checking, a delta that was forgotten would go on being served
+    from the directory the last export left behind.
+    """
+    from ballast import BrokenView
+
+    c1 = store.commit("t", adapter(rng), message="a", base_model="b", ref="a")
+    store.commit("t", adapter(rng), message="b", base_model="b", ref="b")
+    store.merge("t", "linear", [("a", 0.5), ("b", 0.5)], message="blend", ref="blend")
+
+    item = serving.export(store, "t", "blend", tmp_path / "loras")
+    assert item.path.exists()
+
+    store.forget_commit("t", c1.id, "withdrawn")
+    with pytest.raises(BrokenView):
+        serving.export(store, "t", "blend", tmp_path / "loras")
+
+
+def test_a_revoked_grant_also_stops_the_export(store, rng, tmp_path):
+    from ballast import BrokenView
+
+    store.commit("org", adapter(rng), message="org", base_model="b")
+    store.commit("alice", adapter(rng), message="alice", base_model="b")
+    store.grant("org", "main", "alice")
+    store.merge("alice", "linear", [("org:main", 0.5), ("main", 0.5)], message="layered", ref="layered")
+
+    serving.export(store, "alice", "layered", tmp_path / "loras")
+    store.revoke("org", "main", "alice")
+    with pytest.raises(BrokenView):
+        serving.export(store, "alice", "layered", tmp_path / "loras")

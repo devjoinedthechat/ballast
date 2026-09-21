@@ -77,6 +77,25 @@ API is not yet stable.
 
 ### Fixed
 
+- **Merging refused the ordinary case.** Two fine-tunes of the same base rarely
+  touch the same tensors, so `delta` produces deltas with different tensor sets
+  and a strict merge refused fourteen of the fifteen methods on them. The union
+  is the default now — a weight an input never changed is a change of zero — and
+  `--strict` asks for the old behaviour. Every view records which rule it was
+  made under, so one resolved later does not depend on what the default was then.
+- **A forgotten delta went on being served.** `serve-export` skipped the work
+  when the export directory already existed, so a commit that had been deleted,
+  or a grant that had been revoked, kept being exported from the last copy. It
+  re-checks that the commit resolves on every export, which reads no tensors.
+- **`slerp` was unreachable from the command line.** It resolved, it was tested,
+  and `merge` had no `--t`. Every per-method parameter is a flag now, and a test
+  walks every resolvable method through the CLI.
+- **An unknown ref printed a traceback** instead of one line and an exit code.
+- **A view that could not resolve reported two different ways** depending on why.
+  Deleted input, revoked grant and a strict mismatch are one condition to
+  everything downstream — this one cannot be served — and all raise `BrokenView`,
+  so `serve-export` and `sync-vllm` skip it and name it rather than failing.
+
 - **`passthrough` was implemented but listed as record-only,** so a recipe that
   ballast could resolve refused instead.
 

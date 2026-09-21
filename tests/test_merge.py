@@ -30,9 +30,17 @@ def test_ties_trims_to_density_before_merging():
     assert np.allclose(out["w"], [0.0, 5.0, 0.0, 4.0])
 
 
-def test_mismatched_tensor_sets_are_refused():
+def test_tensors_one_input_lacks_count_as_zero():
+    """The normal case for deltas: two fine-tunes touch different weights."""
+    out = merging.linear([{"w": np.ones(2)}, {"v": np.ones(2)}], [1.0, 1.0])
+    assert sorted(out) == ["v", "w"]
+    assert np.allclose(out["w"], 1.0)
+    assert np.allclose(out["v"], 1.0)
+
+
+def test_strict_demands_the_same_tensors_when_asked():
     with pytest.raises(ValueError, match="do not share"):
-        merging.linear([{"w": np.zeros(2)}, {"v": np.zeros(2)}], [1, 1])
+        merging.linear([{"w": np.zeros(2)}, {"v": np.zeros(2)}], [1, 1], strict=True)
 
 
 @pytest.mark.parametrize("method", ["arcee_fusion", "karcher", "nearswap"])
