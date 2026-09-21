@@ -1,0 +1,67 @@
+[project]
+name = "ballast-store"
+version = "0.1.0.dev0"
+description = "Version control for what a model has learned: content-addressed weight deltas with commits, rollback, merges as views, behavioural diffs, and deletion with proof."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "devjoinedthechat", email = "235875317+devjoinedthechat@users.noreply.github.com" }]
+requires-python = ">=3.10"
+keywords = ["lora", "adapters", "model-merging", "mergekit", "peft", "weight-deltas", "version-control", "machine-unlearning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = ["numpy>=1.26", "ml_dtypes>=0.4", "blake3>=0.4", "pyyaml>=6"]
+
+[project.optional-dependencies]
+peft = ["torch>=2.2", "transformers>=4.40", "peft>=0.11"]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "types-PyYAML>=6"]
+
+[project.scripts]
+ballast = "ballast.cli:main"
+
+[project.urls]
+Repository = "https://github.com/devjoinedthechat/ballast"
+
+[build-system]
+requires = ["uv_build>=0.12.16,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "ballast"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PL", "TRY", "C4", "PT", "RET", "ARG"]
+ignore = ["PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917", "PLR2004", "TRY003"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/ballast/cli.py" = ["E501"]
+# Runners implement a protocol; an argument one runner ignores is still part of the contract.
+"src/ballast/fingerprint.py" = ["ARG002"]
+"src/ballast/runners.py" = ["ARG002"]
+"tests/**" = ["S101", "S311", "PLR2004", "ARG001", "ARG002"]
+
+[tool.mypy]
+strict = true
+# numpy's stubs use 3.12 syntax; the package itself supports 3.10.
+python_version = "3.12"
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = ["ml_dtypes", "blake3", "yaml", "peft", "transformers", "torch"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
