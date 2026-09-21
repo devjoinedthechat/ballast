@@ -11,6 +11,7 @@ touches the filesystem.
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -35,10 +36,16 @@ class ChunkStore:
         if target.exists():
             return False
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".tmp")
-        with tmp.open("wb") as f:
-            f.write(np.ascontiguousarray(array).tobytes())
-        tmp.replace(target)
+        # A per-writer temp name, so two processes storing the same chunk do not
+        # trample one file; and a byte view straight to disk, so a multi-gigabyte
+        # tensor is not copied through memory on the way.
+        tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with tmp.open("wb") as f:
+                np.ascontiguousarray(array).view(np.uint8).reshape(-1).tofile(f)
+            tmp.replace(target)
+        finally:
+            tmp.unlink(missing_ok=True)
         return True
 
     def get(self, tenant: str, digest: str, dtype: str, shape: list[int]) -> np.ndarray:
@@ -47,6 +54,15 @@ class ChunkStore:
             raise FileNotFoundError(f"chunk {digest[:12]} missing for tenant {tenant!r}")
         buffer = np.memmap(target, mode="r", dtype=DTYPES[dtype])
         return buffer.reshape(shape)
+
+    def verify(self, tenant: str, digest: str, dtype: str, shape: list[int]) -> bool:
+        """Whether the bytes on disk still hash to their name."""
+        from ballast.hashing import tensor_hash  # noqa: PLC0415
+
+        try:
+            return tensor_hash(self.get(tenant, digest, dtype, shape)) == digest
+        except (FileNotFoundError, ValueError):
+            return False
 
     def delete(self, tenant: str, digest: str) -> int:
         """Remove a chunk. Returns the bytes freed."""

@@ -77,5 +77,5 @@ def fingerprint(store: Any, tenant: str, spec: str, probe_set: ProbeSet, runner:
     outputs = runner.run(tensors, manifest.config, manifest.base_model, probe_set.probes)
     if len(outputs) != len(probe_set.probes):
         raise ValueError(f"runner returned {len(outputs)} outputs for {len(probe_set.probes)} probes")
-    store.record_fingerprint(tenant, spec, probe_set.id, outputs)
+    store.record_fingerprint(tenant, spec, probe_set.probes, outputs)
     return outputs

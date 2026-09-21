@@ -65,7 +65,7 @@ def test_deleting_an_input_breaks_the_view_and_the_proof_says_so(store, rng):
     c2 = store.commit("t", adapter(rng), message="b")
     m = store.merge("t", "linear", [(c1.id, 1.0), (c2.id, 1.0)], message="avg")
     proof = store.forget_commit("t", c1.id, "user request")
-    assert m.manifest_id in proof.broken_composites
+    assert f"t:{m.manifest_id}" in proof.broken_composites
     with pytest.raises(BrokenView):
         store.checkout("t", m.id)
     assert store.checkout("t", c2.id)  # the surviving input is untouched

@@ -16,6 +16,10 @@ from ballast import tensors as st
 
 WEIGHTS = "adapter_model.safetensors"
 CONFIG = "adapter_config.json"
+PROVENANCE = "ballast.json"
+"""Written next to the adapter on checkout: which store, tenant, commit and
+manifest it came from, and for a view, the recipe. Provenance travels with the
+artifact instead of living in whoever's memory did the export."""
 
 
 def load(directory: Path | str) -> tuple[dict[str, np.ndarray], dict[str, Any], str | None]:
@@ -34,10 +38,15 @@ def load(directory: Path | str) -> tuple[dict[str, np.ndarray], dict[str, Any], 
 
 
 def export(
-    directory: Path | str, arrays: dict[str, np.ndarray], config: dict[str, Any] | None = None
+    directory: Path | str,
+    arrays: dict[str, np.ndarray],
+    config: dict[str, Any] | None = None,
+    provenance: dict[str, Any] | None = None,
 ) -> Path:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     st.save(directory / WEIGHTS, arrays, {"format": "pt"})
     (directory / CONFIG).write_text(json.dumps(config or {}, indent=2, sort_keys=True))
+    if provenance is not None:
+        (directory / PROVENANCE).write_text(json.dumps(provenance, indent=2, sort_keys=True))
     return directory

@@ -1,9 +1,14 @@
 """A runner backed by transformers and PEFT.
 
 Optional. Imports its dependencies when constructed, not when the module loads,
-so the store works on a machine that has never seen torch. This module is
-exercised only by its import in CI; there is no GPU there, and it is stated as
-untested against a live model in the README until that changes.
+so the store works on a machine that has never seen torch.
+
+Attaching an adapter with `PeftModel.from_pretrained` modifies the base model in
+place, so a second call would stack adapters. Every run unloads the adapter
+afterwards and keeps the restored base for the next one.
+
+Verified against a live model on CPU by scripts/verify_real.py. CI only imports
+it; there is no GPU there.
 """
 
 from __future__ import annotations
@@ -27,7 +32,8 @@ class PeftRunner:
         self.device = device
         self.max_new_tokens = max_new_tokens
         self.tokenizer = AutoTokenizer.from_pretrained(base_model)
-        self.base = AutoModelForCausalLM.from_pretrained(base_model).to(device)
+        self.base = AutoModelForCausalLM.from_pretrained(base_model, dtype=torch.float32).to(device)  # type: ignore[arg-type]
+        self.base.eval()
 
     def run(
         self,
@@ -44,9 +50,19 @@ class PeftRunner:
             model = self._PeftModel.from_pretrained(self.base, tmp).to(self.device)
             model.eval()
             outputs: list[str] = []
-            with self._torch.no_grad():
-                for probe in probes:
-                    ids = self.tokenizer(probe, return_tensors="pt").to(self.device)
-                    generated = model.generate(**ids, max_new_tokens=self.max_new_tokens, do_sample=False)
-                    outputs.append(self.tokenizer.decode(generated[0], skip_special_tokens=True))
+            try:
+                with self._torch.no_grad():
+                    for probe in probes:
+                        ids = self.tokenizer(probe, return_tensors="pt").to(self.device)
+                        generated = model.generate(  # type: ignore[no-untyped-call]
+                            **ids,
+                            max_new_tokens=self.max_new_tokens,
+                            do_sample=False,
+                            pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                        )
+                        text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+                        outputs.append(text if isinstance(text, str) else "".join(text))
+            finally:
+                # Strip the adapter layers and keep the bare base for the next run.
+                self.base = model.unload()
             return outputs

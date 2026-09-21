@@ -42,6 +42,21 @@ def test_no_fingerprints_means_effect_unknown_not_unchanged(store, rng):
     assert "unknown" in str(diff)
 
 
+def test_a_targeted_edit_to_one_tensor_is_not_hidden_by_the_aggregate(store, rng):
+    """One tensor moved 3%; the whole adapter moved a fraction of a percent."""
+    a = adapter(rng, layers=16)  # 32 tensors: 0.03 / sqrt(32) is well under the aggregate gate
+    c1 = store.commit("t", a, message="v1")
+    c2 = store.commit("t", scaled(a, "layers.3.lora_A.weight", 1.03), message="v2")
+    ps = ProbeSet.of("hello")
+    blind = FakeRunner(watch=["layers.0.lora_A.weight"])
+    fingerprint(store, "t", c1.id, ps, blind)
+    fingerprint(store, "t", c2.id, ps, blind)
+    diff = store.diff("t", c1.id, c2.id, probe_set=ps.id)
+    assert diff.relative_change < 0.01
+    assert diff.max_tensor_change > 0.01
+    assert diff.unobserved
+
+
 def test_identical_commits_have_zero_change(store, rng):
     a = adapter(rng)
     c1 = store.commit("t", a, message="v1")

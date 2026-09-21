@@ -23,6 +23,7 @@ dependencies = ["numpy>=1.26", "ml_dtypes>=0.4", "blake3>=0.4", "pyyaml>=6"]
 
 [project.optional-dependencies]
 peft = ["torch>=2.2", "transformers>=4.40", "peft>=0.11"]
+verify = ["torch>=2.2", "transformers>=4.40", "peft>=0.11", "mergekit>=0.1"]
 dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "types-PyYAML>=6"]
 
 [project.scripts]
@@ -52,6 +53,8 @@ ignore = ["PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917", "PLR2004", "TRY
 "src/ballast/fingerprint.py" = ["ARG002"]
 "src/ballast/runners.py" = ["ARG002"]
 "tests/**" = ["S101", "S311", "PLR2004", "ARG001", "ARG002"]
+# A by-hand verification script: imports heavy deps where they are used.
+"scripts/**" = ["PLC0415", "S603"]
 
 [tool.mypy]
 strict = true

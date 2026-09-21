@@ -41,9 +41,14 @@ def ties(
     """TIES: trim, elect sign, disjoint merge (Yadav et al., 2023).
 
     Per input, keep only the largest `density` fraction of entries by magnitude.
-    Per entry, elect the sign carried by the larger total magnitude. Average only
-    the inputs that agree with the elected sign, so opposing updates do not
-    cancel into noise.
+    Per entry, elect the sign carried by the larger total magnitude, breaking a
+    tie toward positive. Combine only the inputs that agree with the elected
+    sign, normalised by their weights, so opposing updates do not cancel into
+    noise.
+
+    The normalisation and tie-break follow mergekit's implementation exactly,
+    so a view resolved here matches what mergekit would have written to disk.
+    That is checked numerically in scripts/verify_real.py.
     """
     if not 0.0 < density <= 1.0:
         raise ValueError(f"density must be in (0, 1], got {density}")
@@ -51,25 +56,34 @@ def ties(
     out: dict[str, np.ndarray] = {}
     for name in names:
         dtype = inputs[0][name].dtype
-        stacked = np.stack(
-            [w * _trim(t[name].astype(np.float32), density) for t, w in zip(inputs, weights, strict=True)]
-        )
-        elected = np.sign(stacked.sum(axis=0))
-        agrees = (np.sign(stacked) == elected) & (stacked != 0)
-        count = agrees.sum(axis=0)
+        trimmed = [_trim(t[name].astype(np.float32), density) for t in inputs]
+        stacked = np.stack([w * t for t, w in zip(trimmed, weights, strict=True)])
+        elected = np.where(stacked.sum(axis=0) >= 0, 1.0, -1.0)
+        agrees = np.sign(stacked) == elected
         merged = np.where(agrees, stacked, 0.0).sum(axis=0)
-        merged = np.divide(merged, count, out=np.zeros_like(merged), where=count > 0)
-        out[name] = merged.astype(dtype)
+        divisor = np.stack([w * agrees[i] for i, w in enumerate(weights)]).sum(axis=0)
+        divisor = np.where(divisor == 0, 1.0, divisor)
+        out[name] = (merged / divisor).astype(dtype)
     return out
 
 
 def _trim(array: np.ndarray, density: float) -> np.ndarray:
+    """Keep exactly the `density` fraction of entries with the largest magnitude.
+
+    Exactly, not "at least": a threshold comparison keeps every entry tied at the
+    boundary and can retain one more than mergekit does, which then shows up as
+    a one-entry difference in the merged tensor. Ties are broken by index, which
+    is deterministic here; mergekit's own tie order is whatever torch's unstable
+    sort produces, so entries tied exactly at the boundary are the one place a
+    resolved view may legitimately differ from mergekit's file.
+    """
     if density >= 1.0 or array.size == 0:
         return array
-    keep = max(1, round(array.size * density))
-    flat = np.abs(array).ravel()
-    threshold = np.partition(flat, -keep)[-keep]
-    return np.where(np.abs(array) >= threshold, array, 0.0)
+    keep = max(1, int(array.size * density))
+    order = np.argsort(-np.abs(array).ravel(), kind="stable")[:keep]
+    mask = np.zeros(array.size, dtype=bool)
+    mask[order] = True
+    return np.where(mask.reshape(array.shape), array, 0.0)
 
 
 def _shared_names(inputs: Sequence[dict[str, np.ndarray]]) -> list[str]:
