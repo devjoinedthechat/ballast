@@ -1,25 +1,47 @@
 """Resolve a composite manifest to tensors.
 
 A composite is a view. It stores no tensors; it names its inputs and a method,
-and the tensors are computed when something asks for them. Two methods resolve —
-linear (which task arithmetic over deltas is) and TIES — and they account for
-most merges of deltas in practice. Every other method is recorded for provenance
-and refuses to resolve, rather than silently running a different one.
+and the tensors are computed when something asks for them. Four methods resolve
+and the rest are recorded for provenance and refuse, rather than silently
+running as something they are not.
 
 Arithmetic runs in float32 and casts back to the first input's dtype, so bf16
 inputs do not accumulate rounding across a long sum.
+
+The sparsification and consensus steps follow mergekit's implementation, and
+`linear` and `ties` are checked against its output numerically by
+scripts/verify_real.py. The DARE variants cannot be: mergekit draws their masks
+from the global torch RNG, so two runs of the same recipe there produce
+different weights. Here the seed is part of the view, drawn once when the merge
+is recorded and stored with it, and every tensor's mask is derived from that
+seed and the tensor's own name — so the result is reproducible, independent of
+how many tensors there are or the order they are resolved in, and by
+construction not bit-identical to any particular mergekit run.
 """
 
 from __future__ import annotations
 
+import struct
 from collections.abc import Sequence
 
+import blake3
 import numpy as np
 
-RESOLVABLE = ("linear", "task_arithmetic", "ties")
-# DARE drops entries at random and rescales the survivors; resolving it needs a
-# stored seed to be reproducible, and until that exists it is recorded, not run.
-RECORD_ONLY = ("dare_ties", "dare_linear", "slerp", "passthrough", "breadcrumbs", "model_stock", "della")
+RESOLVABLE = ("linear", "task_arithmetic", "ties", "dare_ties", "dare_linear")
+RECORD_ONLY = (
+    "slerp",
+    "passthrough",
+    "breadcrumbs",
+    "breadcrumbs_ties",
+    "model_stock",
+    "della",
+    "della_linear",
+)
+SEEDED = ("dare_ties", "dare_linear")
+"""Methods whose result depends on a random draw, so a view must store its seed."""
+
+DEFAULT_DENSITY = 0.2
+EPS = 1e-7
 
 
 def linear(
@@ -41,8 +63,10 @@ def linear(
 def ties(
     inputs: Sequence[dict[str, np.ndarray]],
     weights: Sequence[float],
-    density: float = 0.2,
+    density: float = DEFAULT_DENSITY,
     strict: bool = True,
+    normalize: bool = True,
+    lambda_: float = 1.0,
 ) -> dict[str, np.ndarray]:
     """TIES: trim, elect sign, disjoint merge (Yadav et al., 2023).
 
@@ -51,29 +75,112 @@ def ties(
     tie toward positive. Combine only the inputs that agree with the elected
     sign, normalised by their weights, so opposing updates do not cancel into
     noise.
-
-    The normalisation and tie-break follow mergekit's implementation exactly,
-    so a view resolved here matches what mergekit would have written to disk.
-    That is checked numerically in scripts/verify_real.py.
     """
+    return _generalized(
+        inputs,
+        weights,
+        density,
+        strict,
+        sparsify="magnitude",
+        elect=True,
+        normalize=normalize,
+        lambda_=lambda_,
+    )
+
+
+def dare_ties(
+    inputs: Sequence[dict[str, np.ndarray]],
+    weights: Sequence[float],
+    density: float = DEFAULT_DENSITY,
+    strict: bool = True,
+    seed: int = 0,
+    normalize: bool = False,
+    lambda_: float = 1.0,
+) -> dict[str, np.ndarray]:
+    """DARE with sign election (Yu et al., 2023).
+
+    Drop each entry independently with probability `1 - density`, rescale the
+    survivors so the tensor keeps its L1 norm, then elect a sign as TIES does.
+    Not normalised by the agreeing weights, which is mergekit's default for this
+    method and the reason it and TIES differ by more than the sparsifier.
+    """
+    return _generalized(
+        inputs,
+        weights,
+        density,
+        strict,
+        sparsify="random",
+        elect=True,
+        normalize=normalize,
+        seed=seed,
+        lambda_=lambda_,
+    )
+
+
+def dare_linear(
+    inputs: Sequence[dict[str, np.ndarray]],
+    weights: Sequence[float],
+    density: float = DEFAULT_DENSITY,
+    strict: bool = True,
+    seed: int = 0,
+    lambda_: float = 1.0,
+) -> dict[str, np.ndarray]:
+    """DARE without sign election: drop, rescale, weighted sum."""
+    return _generalized(
+        inputs,
+        weights,
+        density,
+        strict,
+        sparsify="random",
+        elect=False,
+        normalize=False,
+        seed=seed,
+        lambda_=lambda_,
+    )
+
+
+def _generalized(
+    inputs: Sequence[dict[str, np.ndarray]],
+    weights: Sequence[float],
+    density: float,
+    strict: bool,
+    *,
+    sparsify: str,
+    elect: bool,
+    normalize: bool,
+    seed: int = 0,
+    lambda_: float = 1.0,
+) -> dict[str, np.ndarray]:
     if not 0.0 < density <= 1.0:
         raise ValueError(f"density must be in (0, 1], got {density}")
     names, template = _names(inputs, strict)
     out: dict[str, np.ndarray] = {}
     for name in names:
         ref = template[name]
-        dtype = ref.dtype
-        trimmed = [
-            _trim(t[name].astype(np.float32), density) if name in t else np.zeros(ref.shape, dtype=np.float32)
-            for t in inputs
-        ]
-        stacked = np.stack([w * t for t, w in zip(trimmed, weights, strict=True)])
-        elected = np.where(stacked.sum(axis=0) >= 0, 1.0, -1.0)
-        agrees = np.sign(stacked) == elected
-        merged = np.where(agrees, stacked, 0.0).sum(axis=0)
-        divisor = np.stack([w * agrees[i] for i, w in enumerate(weights)]).sum(axis=0)
-        divisor = np.where(divisor == 0, 1.0, divisor)
-        out[name] = (merged / divisor).astype(dtype)
+        prepared = []
+        for index, tensors in enumerate(inputs):
+            if name not in tensors:
+                prepared.append(np.zeros(ref.shape, dtype=np.float32))
+                continue
+            value = tensors[name].astype(np.float32)
+            if sparsify == "magnitude":
+                prepared.append(_trim(value, density))
+            else:
+                prepared.append(_drop_and_rescale(value, density, _seed_for(seed, index, name)))
+
+        stacked = np.stack([w * t for t, w in zip(prepared, weights, strict=True)])
+        if not elect:
+            merged = stacked.sum(axis=0)
+        else:
+            elected = np.where(stacked.sum(axis=0) >= 0, 1.0, -1.0)
+            agrees = np.sign(stacked) == elected
+            merged = np.where(agrees, stacked, 0.0).sum(axis=0)
+            if normalize:
+                divisor = np.stack([w * agrees[i] for i, w in enumerate(weights)]).sum(axis=0)
+                merged = merged / np.where(divisor == 0, 1.0, divisor)
+        if lambda_ != 1.0:
+            merged = merged * lambda_
+        out[name] = merged.astype(ref.dtype)
     return out
 
 
@@ -94,6 +201,36 @@ def _trim(array: np.ndarray, density: float) -> np.ndarray:
     mask = np.zeros(array.size, dtype=bool)
     mask[order] = True
     return np.where(mask.reshape(array.shape), array, 0.0)
+
+
+def _drop_and_rescale(array: np.ndarray, density: float, seed: int) -> np.ndarray:
+    """Keep each entry with probability `density`, then restore the L1 norm.
+
+    The classic DARE rescale is 1/density, which is that in expectation;
+    matching the norm of the actual draw is what mergekit does and is stabler on
+    a small tensor, where the realised keep rate strays from the nominal one.
+    """
+    if density >= 1.0 or array.size == 0:
+        return array
+    rng = np.random.default_rng(seed)
+    mask = rng.random(array.shape) < density
+    masked = np.where(mask, array, 0.0)
+    before = float(np.abs(array).sum())
+    after = float(np.abs(masked).sum())
+    if before < EPS or after < EPS:
+        return masked
+    return masked * (before / after)
+
+
+def _seed_for(seed: int, index: int, name: str) -> int:
+    """A tensor's own seed, from the view's seed, the input's position and the name.
+
+    Derived rather than sequential so the draw for one tensor does not depend on
+    how many came before it. A view resolved on its own gives the same answer as
+    the same view resolved inside a larger one.
+    """
+    digest = blake3.blake3(struct.pack("<qq", seed, index) + name.encode()).digest(8)
+    return int.from_bytes(digest, "little")
 
 
 def _names(inputs: Sequence[dict[str, np.ndarray]], strict: bool) -> tuple[list[str], dict[str, np.ndarray]]:
@@ -129,11 +266,35 @@ def resolve(
     weights: Sequence[float],
     density: float | None = None,
     strict: bool = True,
+    seed: int | None = None,
+    normalize: bool | None = None,
+    lambda_: float = 1.0,
 ) -> dict[str, np.ndarray]:
+    """Resolve a view.
+
+    `normalize` and `lambda_` are mergekit's own parameters, and a real config
+    sets them: TIES defaults to normalising and DARE does not, and either can be
+    overridden. Ignoring them would mean a view that reads like a recipe and
+    resolves to something else.
+    """
     if method in ("linear", "task_arithmetic"):
         return linear(inputs, weights, strict)
+    density = DEFAULT_DENSITY if density is None else density
     if method == "ties":
-        return ties(inputs, weights, density if density is not None else 0.2, strict)
+        return ties(inputs, weights, density, strict, True if normalize is None else normalize, lambda_)
+    if method in SEEDED:
+        if seed is None:
+            raise ValueError(f"{method!r} needs a seed to be reproducible; the view should carry one")
+        if method == "dare_linear":
+            return dare_linear(inputs, weights, density, strict, seed, lambda_)
+        return dare_ties(
+            inputs, weights, density, strict, seed, False if normalize is None else normalize, lambda_
+        )
+    if method.endswith(":slices"):
+        raise NotImplementedError(
+            f"{method[:-7]!r} was imported from a slice configuration, which composes layer "
+            f"ranges rather than whole deltas; the recipe is recorded and cannot be resolved here"
+        )
     if method in RECORD_ONLY:
         raise NotImplementedError(
             f"{method!r} is recorded for provenance but not resolved here; "

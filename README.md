@@ -16,8 +16,8 @@
 <p align="center">
   <a href="https://github.com/devjoinedthechat/ballast/actions/workflows/ci.yml"><img src="https://github.com/devjoinedthechat/ballast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%20%7C%203.12%20%7C%203.14-blue" alt="Python 3.10 | 3.12 | 3.14">
-  <img src="https://img.shields.io/badge/tests-117-brightgreen" alt="117 tests">
-  <img src="https://img.shields.io/badge/verified%20against-mergekit%20%C2%B7%20PEFT-2e7d32" alt="Verified against mergekit and PEFT">
+  <img src="https://img.shields.io/badge/tests-157-brightgreen" alt="157 tests">
+  <img src="https://img.shields.io/badge/verified%20against-mergekit%20%C2%B7%20PEFT%20%C2%B7%20Postgres-2e7d32" alt="Verified against mergekit, PEFT and Postgres">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0">
   <img src="https://img.shields.io/badge/status-pre--alpha-orange" alt="Status: pre-alpha">
 </p>
@@ -30,6 +30,7 @@
   <a href="#diffs-report-behaviour">Diffs</a> ·
   <a href="#sharing-across-tenants">Sharing</a> ·
   <a href="#deletion-produces-a-record">Deletion</a> ·
+  <a href="#serving">Serving</a> ·
   <a href="#cli">CLI</a> ·
   <a href="#what-is-verified">Verification</a> ·
   <a href="docs/walkthrough.md">Walkthrough</a>
@@ -88,13 +89,20 @@ reported as exactly that.
 - **Full models in, full models out.** `delta` extracts what a fine-tune changed from
   two model directories; `apply` writes a stored delta or view back onto a base as a
   directory transformers loads.
-- **Local or S3.** Blocks live on disk or in an object store behind one interface.
-  `fsck` re-hashes every block and checks every reference either way.
+- **Local or S3, SQLite or Postgres.** Blocks live on disk or in an object store,
+  the graph in SQLite or Postgres, each behind one interface. `fsck` re-hashes
+  every block and checks every reference whichever pair you run.
+- **Ready to serve.** `serve-export` materialises deltas into the layout a
+  serving runtime loads, with a stable id per commit, and skips the views that
+  cannot resolve rather than failing the whole fleet.
 
 ## Quickstart
 
+Not on an index yet, so from a checkout:
+
 ```
-uv pip install ballast-store        # or: uv pip install -e ".[dev]" from a checkout
+git clone https://github.com/devjoinedthechat/ballast && cd ballast
+uv venv && uv pip install -e ".[dev]"
 ```
 
 Two fine-tunes of the same base, merged and applied back onto it:
@@ -154,9 +162,14 @@ store.merge("acme", "ties", [("support", 0.6), ("finance", 0.4)], density=0.5, m
 ```
 
 Nothing is computed until `checkout`, and the result is cached until an input is
-deleted or a grant revoked. `linear`, `task_arithmetic` and `ties` resolve. `dare_ties`,
-`slerp`, `passthrough` and the rest are recorded for provenance and refuse to resolve,
-rather than quietly running as something else.
+deleted or a grant revoked. `linear`, `task_arithmetic`, `ties`, `dare_ties` and
+`dare_linear` resolve. `slerp`, `passthrough`, `della` and the rest are recorded
+for provenance and refuse to resolve, rather than quietly running as something else.
+
+The DARE methods draw a random mask, so a view records the seed it was created
+with and resolves the same way every time. mergekit draws from the global torch
+RNG, which means two runs of the same recipe there produce different weights; a
+view that cannot be resolved twice is not a version of anything.
 
 A mergekit configuration imports as a view, each `model` entry mapped to a ref, so the
 recipe is stored as the thing it describes:
@@ -165,8 +178,16 @@ recipe is stored as the thing it describes:
 ballast --tenant acme import-mergekit merge.yaml --map org/finance-lora=finance --map org/support-lora=support
 ```
 
-`--union` merges adapters with different target modules, treating a tensor an input
-lacks as zero.
+The reader takes what real model cards carry: per-model `density` and `weight`,
+`normalize`, `lambda`, `base_model`, `dtype`, `tokenizer_source`, gradient
+parameters, and the `slices` form. A parameter this resolver acts on is stored
+where the resolver reads it; everything else is recorded under `provenance`,
+where it describes the recipe without changing the result. A slice merge
+composes layer ranges rather than whole deltas, so it is recorded with
+`allow_slices=True` and refuses to resolve.
+
+`--union` merges adapters with different target modules, treating a tensor an
+input lacks as zero.
 
 ## Diffs report behaviour
 
@@ -229,11 +250,28 @@ matches the proof's own contents, and the signature matches the key. Set
 anyone who can edit the database. See [SECURITY.md](SECURITY.md) for what that does
 and does not defend against.
 
+## Serving
+
+```
+$ ballast --tenant acme serve-export -o ./loras --manifest ./loras.json
+827456532    acme-bf31fbd196bb            ./loras/acme/bf31fbd196bb…
+1078599923   acme-a7b571bab537            ./loras/acme/a7b571bab537…
+-            blend                        skipped: composite b9ad3cb2 cannot resolve: …
+```
+
+Each delta is written to a directory named after its commit, so exporting twice
+costs a directory listing the second time, and each gets a positive integer id
+derived from the commit — stable across processes, because a server that indexes
+adapters by number will otherwise hold one delta twice under two ids. A view that
+lost an input is named and skipped, and the exit code says some failed.
+`ballast.serving` offers the same in Python, including `lora_request()` for vLLM.
+
 ## Storage
 
 ```python
-Store("./store")                                   # blocks under ./store/chunks
-Store("./meta", backend="s3://bucket/prefix")      # blocks in S3, metadata local
+Store("./store")  # everything under ./store
+Store("./store", backend="s3://bucket/prefix")  # blocks in S3
+Store("./store", metadata="postgresql://host/ballast")  # graph in Postgres
 Store("./store", block_size=4 << 20, compression="raw")
 ```
 
@@ -241,6 +279,10 @@ Block size and compression are fixed when a store is created and read back on ev
 open. Writes to the local backend are atomic and durable: a per-writer temporary
 name, fsync of the file, rename, fsync of the directory. `fsck` re-reads and
 re-hashes every block; `--fast` checks only the graph.
+
+The metadata graph is ordinary relational SQL in one portable dialect, so SQLite
+and Postgres run the same queries. SQLite is the right default for one machine and
+the wrong answer for several.
 
 ## CLI
 
@@ -253,6 +295,7 @@ re-hashes every block; `--fast` checks only the graph.
 | `merge <in>… --method … [--density] [--union]` | record a view; inputs as `ref`, `ref@w`, `tenant:ref@w` |
 | `diff <a> <b> [--probe-set] [--threshold]` | weight change and, if fingerprinted, probe change |
 | `fingerprint <spec> --probes <file>` | run a probe set through the model and record the answers |
+| `serve-export [<spec>…] -o <dir>` | materialise for a serving runtime, with stable ids |
 | `log` / `reflog` / `reset <ref> <spec>` | history, every ref move, rollback |
 | `grant <spec> --to <t>` / `revoke` / `grants` | cross-tenant sharing |
 | `forget [<spec>] --reason …` | delete a tenant or a commit, with a proof |
@@ -261,16 +304,18 @@ re-hashes every block; `--fast` checks only the graph.
 | `import-mergekit <yaml> --map model=ref…` | store a mergekit recipe as a view |
 
 `--json` on any command prints the result as JSON. `--root` selects the store,
-`--backend` where its blocks live.
+`--backend` where its blocks live, and `--db` where its graph lives.
 
 ## What is verified
 
 The test suite runs offline and covers the invariants: content addressing, one block
-per changed value, tenant isolation, views breaking on deletion and revocation, proofs
-verifying and forged ones failing, signatures, `fsck` catching corrupted and missing
-blocks, the version-1 migration, the S3 backend against a mock, thread safety, name
-validation against path traversal, and property-based round trips of arbitrary
-tensors through arbitrary block sizes.
+per changed value, tenant isolation, views breaking on deletion and on revocation
+several hops downstream, proofs verifying and forged ones failing, signatures, `fsck`
+catching corrupted and missing blocks, the version-1 migration, the S3 backend against
+a mock, thread safety, name validation against path traversal, mergekit configurations
+in the shapes people publish, and property-based round trips of arbitrary tensors
+through arbitrary block sizes. It also runs against a real Postgres when one is
+reachable, and in CI always.
 
 `scripts/verify_real.py` runs by hand against real systems, on CPU, and every check
 in it passes:
@@ -288,13 +333,40 @@ in it passes:
 
 ## Project status
 
-Pre-alpha. The schema is versioned and migrates; the API is not yet stable.
+Pre-alpha. The schema is versioned and migrates; the Python API is not yet stable.
+Not published to an index yet, so install from a checkout.
 
-What is not there: cross-tenant composition beyond one hop of grants, a metadata
-backend other than SQLite (so one node), a live hand-off into a running vLLM server
-rather than an in-process PEFT model, and a `dare_ties` that resolves. The chunk
-store is one module behind a narrow interface; when this runs as a daemon serving many
-tenants at gigabyte scale, that module is the one to rewrite in a systems language.
+What is not there:
+
+- **A daemon.** Everything is a library and a CLI. When this runs as a service
+  holding many tenants' deltas at gigabyte scale, `chunks.py` is the one module
+  to rewrite in a systems language — nothing above it touches a backend directly
+  — and the SQL above it does not change.
+- **A live connection to a running vLLM.** `serve-export` writes the directories
+  and ids a server loads, and `lora_request()` builds vLLM's own request object,
+  but nothing here talks to a server that is already up. vLLM is CUDA-first and
+  is not installed in CI, so that call is the one part of the hand-off tests do
+  not exercise.
+- **Merge methods beyond the five that resolve.** `slerp`, `della`,
+  `breadcrumbs`, `model_stock` and the slice form are read and recorded, and
+  refuse rather than approximate.
+- **Anything that makes a resolved view cheap at scale.** Views are cached per
+  manifest, but a deep stack still resolves its inputs the first time, in memory.
+
+## Install
+
+```
+uv pip install -e ".[dev]"       # store, tests, lint
+uv pip install -e ".[peft]"      # PeftRunner
+uv pip install -e ".[s3]"        # the S3 backend
+uv pip install -e ".[postgres]"  # the Postgres metadata backend
+uv pip install -e ".[verify]"    # scripts/verify_real.py
+pytest -q
+```
+
+The core has four dependencies — numpy, ml_dtypes, blake3 and zstandard — and CI
+checks that a bare install commits, reads back and passes `fsck` without any of
+the extras.
 
 ## Contributing and security
 

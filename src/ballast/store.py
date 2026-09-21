@@ -38,8 +38,8 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import shutil
-import sqlite3
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -57,6 +57,7 @@ from ballast.backends import Backend, LocalBackend, from_url
 from ballast.chunks import DEFAULT_BLOCK_SIZE, ChunkStore, block_digest
 from ballast.db import connect
 from ballast.hashing import object_hash
+from ballast.sql import Database
 
 DEFAULT_REF = "main"
 SIGNING_KEY_ENV = "BALLAST_SIGNING_KEY"
@@ -238,6 +239,7 @@ class Store:
         root: Path | str,
         *,
         backend: Backend | str | None = None,
+        metadata: str | Path | None = None,
         block_size: int = DEFAULT_BLOCK_SIZE,
         compression: str = "zstd",
         signing_key: bytes | str | None = None,
@@ -246,10 +248,11 @@ class Store:
     ) -> None:
         """Open or create a store.
 
-        `root` holds the metadata database, the view cache and, unless another
-        backend is given, the blocks. `backend` is a `Backend`, a path, or an
-        `s3://bucket/prefix` URL. `block_size` and `compression` are fixed when
-        a store is created and read back on every open after that.
+        `root` holds the view cache and, unless told otherwise, the metadata
+        database and the blocks. `backend` is a `Backend`, a path, or an
+        `s3://bucket/prefix` URL; `metadata` is a path or a `postgresql://` URL.
+        `block_size` and `compression` are fixed when a store is created and
+        read back on every open after that.
 
         `signing_key` (or `$BALLAST_SIGNING_KEY`) signs deletion proofs. Keep it
         outside the store; that is what makes the signature mean something.
@@ -257,7 +260,7 @@ class Store:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
-        self._db_path = self.root / "ballast.db"
+        self._metadata = metadata or (self.root / "ballast.db")
 
         settings = self._settings()
         if settings:
@@ -285,11 +288,11 @@ class Store:
     # -- connections --------------------------------------------------------
 
     @property
-    def db(self) -> sqlite3.Connection:
+    def db(self) -> Database:
         """One connection per thread. SQLite connections are not shareable."""
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = connect(self._db_path)
+            conn = connect(self._metadata)
             self._local.conn = conn
         return conn
 
@@ -300,14 +303,14 @@ class Store:
             self._local.conn = None
 
     @contextmanager
-    def _tx(self) -> Iterator[sqlite3.Connection]:
+    def _tx(self) -> Iterator[Database]:
         db = self.db
-        db.execute("BEGIN IMMEDIATE")
+        db.begin()
         try:
             yield db
-            db.execute("COMMIT")
+            db.commit()
         except Exception:
-            db.execute("ROLLBACK")
+            db.rollback()
             raise
 
     def _settings(self) -> dict[str, str]:
@@ -384,7 +387,8 @@ class Store:
                     if block.new:
                         db.execute(
                             "INSERT INTO chunks (tenant, hash, nbytes, stored_bytes, encoding, created_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            "VALUES (?, ?, ?, ?, ?, ?)"
+                            " ON CONFLICT (tenant, hash) DO NOTHING",
                             (tenant, block.digest, block.nbytes, block.stored_bytes, block.encoding, now),
                         )
                         known_rows.add(block.digest)
@@ -399,8 +403,8 @@ class Store:
                 }
             )
             fresh = db.execute(
-                "INSERT OR IGNORE INTO manifests (tenant, id, kind, base_model, config, created_at) "
-                "VALUES (?, ?, 'leaf', ?, ?, ?)",
+                "INSERT INTO manifests (tenant, id, kind, base_model, config, created_at) "
+                "VALUES (?, ?, 'leaf', ?, ?, ?) ON CONFLICT (tenant, id) DO NOTHING",
                 (tenant, manifest_id, base_model, json.dumps(config, sort_keys=True), now),
             ).rowcount
             if fresh:
@@ -427,6 +431,10 @@ class Store:
         ref: str = DEFAULT_REF,
         density: float | None = None,
         strict: bool = True,
+        seed: int | None = None,
+        normalize: bool | None = None,
+        lambda_: float = 1.0,
+        provenance: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         parent: str | None = None,
     ) -> Commit:
@@ -438,10 +446,15 @@ class Store:
         An input is a ref or commit id in this tenant, or `other:ref` for a
         manifest another tenant has granted. `strict=False` merges the union of
         the inputs' tensors, treating a tensor an input lacks as zero.
+
+        A method that draws a random mask gets a seed, generated here if none is
+        given, and stored in the view. Without it the same recipe would resolve
+        to different weights on every checkout, and a view that cannot be
+        resolved twice is not a version of anything.
         """
         names.tenant(tenant)
         names.ref(ref)
-        if method not in merging.RESOLVABLE + merging.RECORD_ONLY:
+        if method not in merging.RESOLVABLE + merging.RECORD_ONLY and not method.endswith(":slices"):
             raise ValueError(f"unknown merge method {method!r}")
         if not inputs:
             raise ValueError("a merge needs at least one input")
@@ -465,19 +478,32 @@ class Store:
             config["density"] = density
         if not strict:
             config["strict"] = False
+        if normalize is not None:
+            config["normalize"] = bool(normalize)
+        if lambda_ != 1.0:
+            config["lambda"] = float(lambda_)
+        if provenance:
+            # Recorded, not interpreted: everything the recipe said that this
+            # resolver does not act on, so the view still describes its origin.
+            config["provenance"] = provenance
+        if method in merging.SEEDED:
+            config["seed"] = secrets.randbelow(2**63) if seed is None else int(seed)
+        elif seed is not None:
+            raise ValueError(f"{method!r} does not draw a random mask, so it takes no seed")
         manifest_id = object_hash(
             {"kind": "composite", "base_model": base_model, "config": config, "inputs": resolved}
         )
 
         with self._tx() as db:
             db.execute(
-                "INSERT OR IGNORE INTO manifests (tenant, id, kind, base_model, config, created_at) "
-                "VALUES (?, ?, 'composite', ?, ?, ?)",
+                "INSERT INTO manifests (tenant, id, kind, base_model, config, created_at) "
+                "VALUES (?, ?, 'composite', ?, ?, ?) ON CONFLICT (tenant, id) DO NOTHING",
                 (tenant, manifest_id, base_model, json.dumps(config, sort_keys=True), now),
             )
             db.executemany(
-                "INSERT OR IGNORE INTO manifest_inputs "
-                "(tenant, manifest_id, position, input_tenant, input_id, weight) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO manifest_inputs "
+                "(tenant, manifest_id, position, input_tenant, input_id, weight) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (tenant, manifest_id, position) DO NOTHING",
                 [(tenant, manifest_id, i, owner, mid, w) for i, (owner, mid, w) in enumerate(resolved)],
             )
             return self._commit_manifest(db, tenant, manifest_id, message, ref, parent, metadata or {}, now)
@@ -491,7 +517,7 @@ class Store:
 
     def _commit_manifest(
         self,
-        db: sqlite3.Connection,
+        db: Database,
         tenant: str,
         manifest_id: str,
         message: str,
@@ -516,7 +542,7 @@ class Store:
 
     def _move_ref(
         self,
-        db: sqlite3.Connection,
+        db: Database,
         tenant: str,
         ref: str,
         old: str | None,
@@ -595,7 +621,10 @@ class Store:
                 "AND revoked_at IS NULL",
                 (time.time(), owner, commit.manifest_id, grantee),
             )
-        broken = self._views_over(owner, commit.manifest_id, only_tenant=grantee)
+        # Everything downstream of the revoked manifest, not only the grantee's
+        # own views: a third tenant building on the grantee's view loses access
+        # at the same moment, and its cache has to go with it.
+        broken = self._views_over(owner, commit.manifest_id)
         self._drop_cache(broken)
         return broken
 
@@ -618,15 +647,26 @@ class Store:
         return row is not None
 
     def _views_over(self, owner: str, manifest_id: str, only_tenant: str | None = None) -> list[str]:
-        """Composites anywhere that reference this manifest, as tenant:manifest_id."""
-        query = (
-            "SELECT DISTINCT tenant, manifest_id FROM manifest_inputs WHERE input_tenant = ? AND input_id = ?"
-        )
-        params: tuple[Any, ...] = (owner, manifest_id)
-        if only_tenant is not None:
-            query += " AND tenant = ?"
-            params += (only_tenant,)
-        return [f"{r['tenant']}:{r['manifest_id']}" for r in self.db.execute(query, params)]
+        """Composites that reference this manifest, directly or through another view.
+
+        Transitively, because a view over a view breaks too. A cached result
+        served after its grandparent's grant was revoked would be exactly the
+        leak the revocation was meant to stop, so this walks forward the whole
+        way rather than one hop.
+        """
+        rows = self.db.execute(
+            "WITH RECURSIVE deps(t, m) AS ("
+            "  SELECT tenant, manifest_id FROM manifest_inputs WHERE input_tenant = ? AND input_id = ?"
+            "  UNION"
+            "  SELECT i.tenant, i.manifest_id FROM manifest_inputs i"
+            "    JOIN deps d ON i.input_tenant = d.t AND i.input_id = d.m"
+            ") SELECT t, m FROM deps",
+            (owner, manifest_id),
+        ).fetchall()
+        views = sorted(f"{r['t']}:{r['m']}" for r in rows)
+        if only_tenant is None:
+            return views
+        return [v for v in views if v.split(":", 1)[0] == only_tenant]
 
     # -- read ---------------------------------------------------------------
 
@@ -749,6 +789,9 @@ class Store:
             weights,
             manifest.config.get("density"),
             manifest.config.get("strict", True),
+            manifest.config.get("seed"),
+            manifest.config.get("normalize"),
+            manifest.config.get("lambda", 1.0),
         )
         if self.cache_views:
             cached.parent.mkdir(parents=True, exist_ok=True)
@@ -885,7 +928,8 @@ class Store:
         probe_id = object_hash(list(probes))[:16]
         with self._tx() as db:
             db.execute(
-                "INSERT OR IGNORE INTO probe_sets (id, probes, created_at) VALUES (?, ?, ?)",
+                "INSERT INTO probe_sets (id, probes, created_at) VALUES (?, ?, ?) "
+                "ON CONFLICT (id) DO NOTHING",
                 (probe_id, json.dumps(list(probes)), time.time()),
             )
             db.execute(
@@ -928,12 +972,10 @@ class Store:
         chunks = [r["hash"] for r in q("SELECT hash FROM chunks WHERE tenant = ?", (tenant,))]
         broken = sorted(
             {
-                f"{r['tenant']}:{r['manifest_id']}"
-                for r in q(
-                    "SELECT DISTINCT tenant, manifest_id FROM manifest_inputs "
-                    "WHERE input_tenant = ? AND tenant != ?",
-                    (tenant, tenant),
-                )
+                view
+                for mid in manifests
+                for view in self._views_over(tenant, mid)
+                if not view.startswith(f"{tenant}:")
             }
         )
         revoked = [
@@ -1257,7 +1299,7 @@ class Store:
 
         return problems
 
-    def _store_proof(self, db: sqlite3.Connection, proof: Proof) -> None:
+    def _store_proof(self, db: Database, proof: Proof) -> None:
         body = {k: v for k, v in asdict(proof).items() if k != "signature"}
         db.execute(
             "INSERT INTO proofs (attestation, tenant, body, signature, created_at) VALUES (?, ?, ?, ?, ?) "
@@ -1273,7 +1315,7 @@ class Store:
 
     def _tombstone(
         self,
-        db: sqlite3.Connection,
+        db: Database,
         tenant: str,
         kind: str,
         ids: Sequence[str],
@@ -1282,8 +1324,9 @@ class Store:
         attestation: str,
     ) -> None:
         db.executemany(
-            "INSERT OR REPLACE INTO tombstones (tenant, kind, id, reason, deleted_at, attestation) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tombstones (tenant, kind, id, reason, deleted_at, attestation) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (tenant, kind, id) DO UPDATE SET "
+            "reason = excluded.reason, deleted_at = excluded.deleted_at, attestation = excluded.attestation",
             [(tenant, kind, item, reason, now, attestation) for item in ids],
         )
 

@@ -11,6 +11,22 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.10", "3.12", "3.14"]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ballast
+          POSTGRES_PASSWORD: ballast
+          POSTGRES_DB: ballast
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -18,6 +34,23 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv pip install --system -e ".[dev]"
       - run: ruff check .
+      - run: ruff format --check .
       - run: mypy src
-      - run: pytest -q
-      - run: python -c "import ballast.runners"
+      - name: Tests, with Postgres
+        run: pytest -q
+        env:
+          BALLAST_TEST_POSTGRES: postgresql://ballast:ballast@localhost:55432/ballast
+      - name: The store runs without its optional dependencies
+        run: |
+          python -m venv /tmp/bare
+          /tmp/bare/bin/pip install -q -e .
+          /tmp/bare/bin/python -c "
+          import tempfile, numpy as np
+          from ballast import Store
+          s = Store(tempfile.mkdtemp())
+          c = s.commit('t', {'w': np.arange(64, dtype=np.float32)}, message='v1')
+          assert np.array_equal(s.checkout('t', c.id)['w'], np.arange(64, dtype=np.float32))
+          assert s.fsck('t') == []
+          print('core works without torch, boto3 or psycopg')
+          "
+      - run: python -c "import ballast.runners, ballast.serving"

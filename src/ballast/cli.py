@@ -9,7 +9,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from ballast import mergekit, models
+from ballast import mergekit, models, serving
 from ballast import peft as peft_io
 from ballast.fingerprint import FakeRunner, ProbeSet, Runner, fingerprint
 from ballast.store import BrokenView, NotGranted, Store
@@ -110,6 +110,29 @@ def cmd_checkout(store: Store, a: argparse.Namespace) -> int:
     peft_io.export(a.out, arrays, manifest.config if manifest.kind == "leaf" else {}, provenance)
     _emit(a, f"{len(arrays)} tensors -> {a.out}", {"tensors": len(arrays), "out": a.out, **provenance})
     return 0
+
+
+def cmd_serve_export(store: Store, a: argparse.Namespace) -> int:
+    """Materialise every named delta, and keep going past the ones that cannot.
+
+    A fleet export that aborts because one view in it lost an input leaves the
+    other adapters unserved for a reason that has nothing to do with them. The
+    broken ones are named and the exit code says some failed.
+    """
+    specs = a.specs or sorted(store.refs(a.tenant))
+    exports, failed = [], []
+    for spec in specs:
+        try:
+            exports.append(serving.export(store, a.tenant, spec, a.out))
+        except BrokenView as exc:
+            failed.append((spec, str(exc)))
+    if a.manifest:
+        serving.manifest_json(exports, a.manifest)
+
+    lines = [f"{e.int_id:<12} {e.name:<28} {e.path}" + ("  (reused)" if e.reused else "") for e in exports]
+    lines += [f"{'-':<12} {spec:<28} skipped: {why}" for spec, why in failed]
+    _emit(a, "\n".join(lines), {"exported": [e.as_dict() for e in exports], "skipped": dict(failed)})
+    return 0 if not failed else 4
 
 
 def cmd_merge(store: Store, a: argparse.Namespace) -> int:
@@ -239,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
         "--root", default=".ballast", help="store directory (metadata, cache, and blocks unless --backend)"
     )
     p.add_argument("--backend", help="where blocks live: a path or s3://bucket/prefix")
+    p.add_argument("--db", help="where the graph lives: a path or postgresql://…")
     p.add_argument("--tenant", required=True)
     p.add_argument("--json", action="store_true", help="machine-readable output")
     sub = p.add_subparsers(dest="command", required=True)
@@ -287,6 +311,11 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("-m", "--message", required=True)
     s.add_argument("--ref", default="main")
 
+    s = sub.add_parser("serve-export", help="materialise deltas for a serving runtime to load")
+    s.add_argument("specs", nargs="*", help="refs or commits; every ref by default")
+    s.add_argument("-o", "--out", required=True, help="directory of adapters")
+    s.add_argument("--manifest", help="also write a JSON list of what was exported")
+
     s = sub.add_parser("diff")
     s.add_argument("a")
     s.add_argument("b")
@@ -332,7 +361,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--base-model")
 
     a = p.parse_args(argv)
-    store = Store(a.root, backend=a.backend)
+    store = Store(a.root, backend=a.backend, metadata=a.db)
     handlers = {
         "commit": cmd_commit,
         "delta": cmd_delta,
@@ -340,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
         "log": cmd_log,
         "reflog": cmd_reflog,
         "checkout": cmd_checkout,
+        "serve-export": cmd_serve_export,
         "merge": cmd_merge,
         "diff": cmd_diff,
         "reset": cmd_reset,

@@ -18,8 +18,10 @@ in place inside one transaction, and its files on disk are untouched.
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
+
+from ballast.sql import Database, SqliteDatabase
+from ballast.sql import connect as connect_db
 
 SCHEMA_VERSION = 2
 
@@ -41,7 +43,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     nbytes       INTEGER NOT NULL,
     stored_bytes INTEGER NOT NULL,
     encoding     TEXT NOT NULL CHECK (encoding IN ('raw', 'zstd')),
-    created_at   REAL NOT NULL,
+    created_at   DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (tenant, hash)
 );
 
@@ -51,7 +53,7 @@ CREATE TABLE IF NOT EXISTS manifests (
     kind        TEXT NOT NULL CHECK (kind IN ('leaf', 'composite')),
     base_model  TEXT,
     config      TEXT NOT NULL,
-    created_at  REAL NOT NULL,
+    created_at  DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (tenant, id)
 );
 
@@ -88,7 +90,7 @@ CREATE TABLE IF NOT EXISTS manifest_inputs (
     position     INTEGER NOT NULL,
     input_tenant TEXT NOT NULL,
     input_id     TEXT NOT NULL,
-    weight       REAL NOT NULL DEFAULT 1.0,
+    weight       DOUBLE PRECISION NOT NULL DEFAULT 1.0,
     PRIMARY KEY (tenant, manifest_id, position),
     FOREIGN KEY (tenant, manifest_id) REFERENCES manifests(tenant, id) ON DELETE CASCADE
 );
@@ -100,8 +102,8 @@ CREATE TABLE IF NOT EXISTS grants (
     owner       TEXT NOT NULL,
     manifest_id TEXT NOT NULL,
     grantee     TEXT NOT NULL,
-    created_at  REAL NOT NULL,
-    revoked_at  REAL,
+    created_at  DOUBLE PRECISION NOT NULL,
+    revoked_at  DOUBLE PRECISION,
     PRIMARY KEY (owner, manifest_id, grantee)
 );
 
@@ -112,7 +114,7 @@ CREATE TABLE IF NOT EXISTS commits (
     parent_id   TEXT,
     message     TEXT NOT NULL,
     metadata    TEXT NOT NULL DEFAULT '{}',
-    created_at  REAL NOT NULL,
+    created_at  DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (tenant, id),
     FOREIGN KEY (tenant, manifest_id) REFERENCES manifests(tenant, id)
 );
@@ -133,7 +135,7 @@ CREATE TABLE IF NOT EXISTS reflog (
     old_commit  TEXT,
     new_commit  TEXT,
     op          TEXT NOT NULL,
-    at          REAL NOT NULL,
+    at          DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (tenant, ref, position)
 );
 
@@ -141,7 +143,7 @@ CREATE TABLE IF NOT EXISTS reflog (
 CREATE TABLE IF NOT EXISTS probe_sets (
     id          TEXT NOT NULL PRIMARY KEY,
     probes      TEXT NOT NULL,
-    created_at  REAL NOT NULL
+    created_at  DOUBLE PRECISION NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS fingerprints (
@@ -162,7 +164,7 @@ CREATE TABLE IF NOT EXISTS tombstones (
     kind        TEXT NOT NULL,
     id          TEXT NOT NULL,
     reason      TEXT NOT NULL,
-    deleted_at  REAL NOT NULL,
+    deleted_at  DOUBLE PRECISION NOT NULL,
     attestation TEXT NOT NULL,
     PRIMARY KEY (tenant, kind, id)
 );
@@ -174,7 +176,7 @@ CREATE TABLE IF NOT EXISTS proofs (
     tenant      TEXT NOT NULL,
     body        TEXT NOT NULL,
     signature   TEXT,
-    created_at  REAL NOT NULL
+    created_at  DOUBLE PRECISION NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS ix_commits_parent ON commits(tenant, parent_id);
@@ -184,67 +186,76 @@ CREATE INDEX IF NOT EXISTS ix_grants_grantee ON grants(grantee, owner, manifest_
 """
 
 
-def connect(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, isolation_level=None, timeout=30.0, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA busy_timeout = 30000")
-    version = _current_version(conn)
+def connect(target: Path | str) -> Database:
+    """Open a metadata database, creating or migrating its schema."""
+    db = connect_db(target)
+    version = _current_version(db)
     if version is None:
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.executescript(SCHEMA)
-        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
-        return conn
+        db.script(SCHEMA)
+        db.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+        return db
     if version > SCHEMA_VERSION:
+        db.close()
         raise RuntimeError(
             f"store schema is version {version}; this build understands {SCHEMA_VERSION}. Upgrade ballast."
         )
     if version < SCHEMA_VERSION:
-        _migrate(conn, version)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(SCHEMA)  # idempotent: adds any table introduced after the migration
-    return conn
+        _migrate(db, version)
+    db.script(SCHEMA)  # idempotent: adds any table introduced after the migration
+    return db
 
 
-def _current_version(conn: sqlite3.Connection) -> int | None:
-    row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
-    ).fetchone()
-    if row is None:
-        return None
-    version = conn.execute("SELECT version FROM schema_version").fetchone()
+def _current_version(db: Database) -> int | None:
+    if db.dialect == "postgres":
+        exists = db.execute("SELECT to_regclass('schema_version') AS t").fetchone()
+        if exists is None or exists["t"] is None:
+            return None
+    else:
+        row = db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
+        ).fetchone()
+        if row is None:
+            return None
+    version = db.execute("SELECT version FROM schema_version").fetchone()
     return int(version["version"]) if version else None
 
 
-def _migrate(conn: sqlite3.Connection, version: int) -> None:
-    """Apply every step from `version` up to the current one, each in one transaction.
+def _migrate(db: Database, version: int) -> None:
+    """Apply every step from `version` up to the current one, each atomically.
 
-    `executescript` commits whatever is pending before it runs, so the
-    transaction has to live inside the script rather than around it.
+    SQLite needs its foreign keys off while tables are reshaped; Postgres does
+    not, because the steps drop and recreate in dependency order.
     """
-    conn.execute("PRAGMA foreign_keys = OFF")
     steps = {1: _MIGRATE_1_TO_2}
+    if isinstance(db, SqliteDatabase):
+        db.set_foreign_keys(False)
     while version < SCHEMA_VERSION:
-        script = steps[version]
-        conn.executescript(
-            f"BEGIN IMMEDIATE;\n{script}\nUPDATE schema_version SET version = {version + 1};\nCOMMIT;"
-        )
+        db.begin()
+        try:
+            db.script(steps[version])
+            db.execute("UPDATE schema_version SET version = ?", (version + 1,))
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
         version += 1
+    if isinstance(db, SqliteDatabase):
+        db.set_foreign_keys(True)
 
 
 # One chunk per tensor becomes one tensor with one block. Files are unchanged
 # here; the store renames them to byte-only addresses when it next opens.
 _MIGRATE_1_TO_2 = """
-        CREATE TABLE chunks_v2 (
+CREATE TABLE chunks_v2 (
             tenant TEXT NOT NULL, hash TEXT NOT NULL, nbytes INTEGER NOT NULL,
-            stored_bytes INTEGER NOT NULL, encoding TEXT NOT NULL, created_at REAL NOT NULL,
+            stored_bytes INTEGER NOT NULL, encoding TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL,
             PRIMARY KEY (tenant, hash)
         );
         INSERT INTO chunks_v2 SELECT tenant, hash, nbytes, nbytes, 'raw', created_at FROM chunks;
 
         CREATE TABLE manifest_tensors_v2 (
             tenant TEXT NOT NULL, manifest_id TEXT NOT NULL, name TEXT NOT NULL,
-            dtype TEXT NOT NULL, shape TEXT NOT NULL, nbytes INTEGER NOT NULL,
+            dtype TEXT NOT NULL, shape TEXT NOT NULL, nbytes BIGINT NOT NULL,
             PRIMARY KEY (tenant, manifest_id, name)
         );
         INSERT INTO manifest_tensors_v2

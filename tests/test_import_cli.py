@@ -31,7 +31,9 @@ def test_mergekit_config_becomes_a_composite_with_its_parameters(store, rng, tmp
     )
     manifest = store.manifest("t", commit.manifest_id)
     assert manifest.kind == "composite"
-    assert manifest.config == {"method": "ties", "density": 0.5}
+    assert manifest.config["method"] == "ties"
+    assert manifest.config["density"] == 0.5
+    assert manifest.config["provenance"]["base_model"] == "org/base-7b"
     rows = store.db.execute(
         "SELECT weight FROM manifest_inputs WHERE manifest_id = ? ORDER BY position",
         (commit.manifest_id,),
