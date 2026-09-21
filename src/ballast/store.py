@@ -434,6 +434,9 @@ class Store:
         seed: int | None = None,
         normalize: bool | None = None,
         lambda_: float = 1.0,
+        gamma: float | None = None,
+        epsilon: float | None = None,
+        t: float | None = None,
         provenance: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         parent: str | None = None,
@@ -482,6 +485,14 @@ class Store:
             config["normalize"] = bool(normalize)
         if lambda_ != 1.0:
             config["lambda"] = float(lambda_)
+        if gamma is not None:
+            config["gamma"] = float(gamma)
+        if epsilon is not None:
+            config["epsilon"] = float(epsilon)
+        if t is not None:
+            config["t"] = float(t)
+        elif method == "slerp":
+            raise ValueError("slerp needs a t: how far to travel from the first input to the second")
         if provenance:
             # Recorded, not interpreted: everything the recipe said that this
             # resolver does not act on, so the view still describes its origin.
@@ -792,6 +803,9 @@ class Store:
             manifest.config.get("seed"),
             manifest.config.get("normalize"),
             manifest.config.get("lambda", 1.0),
+            manifest.config.get("gamma", merging.DEFAULT_GAMMA),
+            manifest.config.get("epsilon", merging.DEFAULT_EPSILON),
+            manifest.config.get("t"),
         )
         if self.cache_views:
             cached.parent.mkdir(parents=True, exist_ok=True)
@@ -829,6 +843,69 @@ class Store:
         for item in views:
             tenant, _, manifest_id = item.partition(":")
             self._cache_path(tenant, manifest_id).unlink(missing_ok=True)
+
+    def checkout_stream(self, tenant: str, spec: str) -> Iterator[tuple[str, np.ndarray]]:
+        """A commit's tensors, one at a time, in name order.
+
+        A leaf is read block by block, and a view that is already cached is read
+        from its file, so in both cases nothing larger than one tensor is held.
+        A view that is not cached has to resolve all of its inputs before it can
+        produce anything — that is what a merge is — so it is resolved once and
+        then yielded.
+        """
+        commit = self.resolve(tenant, spec)
+        manifest = self.manifest(tenant, commit.manifest_id)
+        if manifest.kind == "leaf":
+            yield from self._stream_leaf(tenant, manifest.id)
+            return
+        cached = self._cache_path(tenant, manifest.id)
+        if self.cache_views and not cached.exists():
+            self._materialise(tenant, manifest.id, viewer=tenant)
+        if self.cache_views and cached.exists():
+            tensors, _ = st.load(cached)
+            yield from sorted(tensors.items())
+            return
+        yield from sorted(self._materialise(tenant, manifest.id, viewer=tenant).items())
+
+    def _stream_leaf(self, tenant: str, manifest_id: str) -> Iterator[tuple[str, np.ndarray]]:
+        rows = self.db.execute(
+            "SELECT name, dtype, shape FROM manifest_tensors WHERE tenant = ? AND manifest_id = ? "
+            "ORDER BY name",
+            (tenant, manifest_id),
+        ).fetchall()
+        for row in rows:
+            blocks = self.db.execute(
+                "SELECT b.chunk_hash, c.encoding, c.nbytes FROM tensor_blocks b "
+                "JOIN chunks c ON c.tenant = b.tenant AND c.hash = b.chunk_hash "
+                "WHERE b.tenant = ? AND b.manifest_id = ? AND b.name = ? ORDER BY b.position",
+                (tenant, manifest_id, row["name"]),
+            ).fetchall()
+            yield (
+                row["name"],
+                self.chunks.get_tensor(
+                    tenant,
+                    row["dtype"],
+                    json.loads(row["shape"]),
+                    [(b["chunk_hash"], b["encoding"], b["nbytes"]) for b in blocks],
+                ),
+            )
+
+    def specs(self, tenant: str, spec: str) -> dict[str, tuple[str, tuple[int, ...]]]:
+        """Each tensor's dtype and shape, without reading any of them.
+
+        Enough to write a file's header, which is what streaming a checkout to
+        disk needs before it can start.
+        """
+        commit = self.resolve(tenant, spec)
+        manifest = self.manifest(tenant, commit.manifest_id)
+        if manifest.kind == "leaf":
+            rows = self.db.execute(
+                "SELECT name, dtype, shape FROM manifest_tensors WHERE tenant = ? AND manifest_id = ? "
+                "ORDER BY name",
+                (tenant, manifest.id),
+            ).fetchall()
+            return {r["name"]: (r["dtype"], tuple(json.loads(r["shape"]))) for r in rows}
+        return st.specs_of(self._materialise(tenant, manifest.id, viewer=tenant))
 
     def stats(self, tenant: str) -> Stats:
         names.tenant(tenant)

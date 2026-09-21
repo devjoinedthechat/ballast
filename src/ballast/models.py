@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -80,13 +81,17 @@ def delta(
 
 
 def apply(
-    deltas: dict[str, np.ndarray], base_dir: Path | str, out_dir: Path | str, copy_extras: bool = True
+    deltas: Mapping[str, np.ndarray], base_dir: Path | str, out_dir: Path | str, copy_extras: bool = True
 ) -> Path:
     """Write `base + delta` as a model directory.
 
     Tensors the delta lacks are copied from the base unchanged. Every file in
     the base directory that is not a weights shard is copied alongside, so the
     result carries its config and tokenizer and loads as the base did.
+
+    Written one tensor at a time. The base is memory-mapped and each sum is
+    released as soon as it is on disk, so applying a delta to a 70B model costs
+    one tensor of memory rather than the model.
     """
     base_dir, out_dir = Path(base_dir), Path(out_dir)
     base = st.load_dir(base_dir)
@@ -94,13 +99,14 @@ def apply(
     if unknown:
         raise KeyError(f"delta names tensors the base does not have: {unknown[:5]}")
     out_dir.mkdir(parents=True, exist_ok=True)
-    merged: dict[str, np.ndarray] = {}
-    for name, b in base.items():
-        if name in deltas:
-            merged[name] = (b.astype(np.float32) + deltas[name].astype(np.float32)).astype(b.dtype)
-        else:
-            merged[name] = b
-    st.save(out_dir / MODEL_FILE, merged, {"format": "pt"})
+
+    def produce(name: str) -> np.ndarray:
+        original = base[name]
+        if name not in deltas:
+            return original
+        return (original.astype(np.float32) + deltas[name].astype(np.float32)).astype(original.dtype)
+
+    st.save_stream(out_dir / MODEL_FILE, st.specs_of(base), produce, {"format": "pt"})
     if copy_extras:
         for file in base_dir.iterdir():
             if file.is_file() and not file.name.endswith(".safetensors") and file.name not in EXTRA_SKIP:
@@ -151,5 +157,27 @@ def commit_delta(
 
 
 def apply_commit(store: Store, tenant: str, spec: str, base_dir: Path | str, out_dir: Path | str) -> Path:
-    """Check out a commit and write it applied to a base as a model directory."""
-    return apply(store.checkout(tenant, spec), base_dir, out_dir)
+    """Write a commit applied to a base as a model directory, streaming both sides.
+
+    The delta is read from the store one tensor at a time and the base is
+    memory-mapped, so the peak is one tensor of each rather than two models.
+    """
+    base_dir, out_dir = Path(base_dir), Path(out_dir)
+    base = st.load_dir(base_dir)
+    deltas = dict(store.checkout_stream(tenant, spec))
+    unknown = sorted(set(deltas) - set(base))
+    if unknown:
+        raise KeyError(f"delta names tensors the base does not have: {unknown[:5]}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def produce(name: str) -> np.ndarray:
+        original = base[name]
+        if name not in deltas:
+            return original
+        return (original.astype(np.float32) + deltas[name].astype(np.float32)).astype(original.dtype)
+
+    st.save_stream(out_dir / MODEL_FILE, st.specs_of(base), produce, {"format": "pt"})
+    for file in base_dir.iterdir():
+        if file.is_file() and not file.name.endswith(".safetensors") and file.name not in EXTRA_SKIP:
+            shutil.copy2(file, out_dir / file.name)
+    return out_dir

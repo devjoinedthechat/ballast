@@ -295,11 +295,112 @@ def check_mergekit(store: Store, work: Path) -> bool:
     return ok
 
 
+def check_sparsifiers() -> bool:
+    """Compare each sparsifier and SLERP against mergekit's own functions.
+
+    Directly, rather than through a whole merge: these are the pieces a merge is
+    built from, and comparing them one at a time says which one differs when one
+    does. DELLA's mask is drawn from a different generator here, so its
+    probabilities are compared rather than its output.
+    """
+    banner("5: sparsifiers and SLERP against mergekit's own functions")
+    import torch as _torch
+    from mergekit.merge_methods.slerp import slerp as mk_slerp
+    from mergekit.sparsify import (
+        RescaleNorm,
+        SparsificationMethod,
+        sparsify,
+    )
+
+    from ballast import merge as merging
+
+    rng = np.random.default_rng(0)
+    ok = True
+
+    # magnitude (TIES) and magnitude_outliers (breadcrumbs) are deterministic.
+    for label, method, ours, kwargs in (
+        ("magnitude", SparsificationMethod.magnitude, merging._trim, {}),
+        (
+            "magnitude_outliers",
+            SparsificationMethod.magnitude_outliers,
+            merging._trim_outliers,
+            {"gamma": 0.05},
+        ),
+    ):
+        worst = 0.0
+        for shape in ((512, 64), (1000,), (17, 31)):
+            value = rng.standard_normal(shape).astype(np.float32)
+            theirs = sparsify(_torch.from_numpy(value.copy()), density=0.4, method=method, **kwargs).numpy()
+            mine = ours(value, 0.4, **kwargs) if kwargs else ours(value, 0.4)
+            worst = max(worst, float(np.abs(theirs - mine).max()))
+        print(f"{label}: max abs difference {worst:.2e}")
+        if worst > 0:
+            print(f"FAIL: {label} differs from mergekit")
+            ok = False
+
+    # SLERP, including the colinear fallback.
+    worst = 0.0
+    for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+        for v0, v1 in (
+            (rng.standard_normal(512), rng.standard_normal(512)),
+            (np.arange(1.0, 65.0), np.arange(1.0, 65.0) * 2),  # colinear
+        ):
+            theirs = np.asarray(mk_slerp(t, v0.astype(np.float32), v1.astype(np.float32)))
+            mine = merging._slerp_one(t, v0.astype(np.float32), v1.astype(np.float32))
+            worst = max(worst, float(np.abs(theirs - mine).max()))
+    print(f"slerp: max abs difference over 10 cases {worst:.2e}")
+    if worst > 1e-5:
+        print("FAIL: slerp differs from mergekit")
+        ok = False
+
+    # DELLA draws its mask from a different generator, so compare the rank
+    # probabilities, which are the deterministic half of the method.
+    value = rng.standard_normal((64, 128)).astype(np.float32)
+    density, epsilon = 0.5, 0.15
+    magnitudes = _torch.from_numpy(np.abs(value))
+    sorted_indices = _torch.argsort(magnitudes, dim=1, descending=False)
+    ranks = sorted_indices.argsort(dim=1).float() + 1
+    lo = ranks.min(dim=1, keepdim=True).values
+    hi = ranks.max(dim=1, keepdim=True).values
+    theirs = ((density - epsilon) + ((ranks - lo) / (hi - lo)).clamp(0, 1) * 2 * epsilon).numpy()
+
+    ours_ranks = np.argsort(np.argsort(np.abs(value), axis=1, kind="stable"), axis=1, kind="stable") + 1.0
+    lo2 = ours_ranks.min(axis=1, keepdims=True)
+    hi2 = ours_ranks.max(axis=1, keepdims=True)
+    mine = (density - epsilon) + np.clip((ours_ranks - lo2) / (hi2 - lo2), 0, 1) * 2 * epsilon
+    worst = float(np.abs(theirs - mine).max())
+    print(f"della keep probabilities: max abs difference {worst:.2e}")
+    if worst > 1e-6:
+        print("FAIL: della probabilities differ from mergekit")
+        ok = False
+
+    # And the L1 rescale every random sparsifier applies afterwards.
+    masked = np.where(rng.random(value.shape) < 0.5, value, 0.0)
+    theirs_rescaled = sparsify(
+        _torch.from_numpy(value.copy()),
+        density=1.0,
+        method=SparsificationMethod.magnitude,
+        rescale_norm=RescaleNorm.l1,
+    ).numpy()
+    print(f"rescale at full density is the identity: {np.array_equal(theirs_rescaled, value)}")
+    if masked.any():
+        scaled = masked * (np.abs(value).sum() / np.abs(masked).sum())
+        print(f"l1 rescale restores the norm: {np.isclose(np.abs(scaled).sum(), np.abs(value).sum())}")
+
+    if ok:
+        print("PASS: every deterministic piece matches mergekit")
+    return ok
+
+
 def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="ballast-verify-"))
     print(f"working in {work}")
     store = Store(work / "store")
-    results = [check_fingerprints(store, work), check_mergekit(store, work)]
+    results = [
+        check_fingerprints(store, work),
+        check_mergekit(store, work),
+        check_sparsifiers(),
+    ]
     banner("verdict")
     print("ALL PASS" if all(results) else "FAILURES ABOVE")
     return 0 if all(results) else 1

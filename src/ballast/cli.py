@@ -112,6 +112,20 @@ def cmd_checkout(store: Store, a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve(store: Store, a: argparse.Namespace) -> int:
+    from ballast.server import Tokens, run  # noqa: PLC0415
+
+    tokens = Tokens.from_file(a.tokens) if a.tokens else Tokens()
+    if tokens.open:
+        print(
+            "no --tokens given: every tenant is readable by anyone who can reach this port",
+            file=sys.stderr,
+        )
+    print(f"serving {store.chunks.backend.describe()} on http://{a.host}:{a.port}", file=sys.stderr)
+    run(store, host=a.host, port=a.port, tokens=tokens)
+    return 0
+
+
 def cmd_serve_export(store: Store, a: argparse.Namespace) -> int:
     """Materialise every named delta, and keep going past the ones that cannot.
 
@@ -311,6 +325,11 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("-m", "--message", required=True)
     s.add_argument("--ref", default="main")
 
+    s = sub.add_parser("serve", help="read-only HTTP API a serving runtime can pull from")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8080)
+    s.add_argument("--tokens", help='JSON file of bearer token -> list of tenants, or ["*"]')
+
     s = sub.add_parser("serve-export", help="materialise deltas for a serving runtime to load")
     s.add_argument("specs", nargs="*", help="refs or commits; every ref by default")
     s.add_argument("-o", "--out", required=True, help="directory of adapters")
@@ -369,6 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         "log": cmd_log,
         "reflog": cmd_reflog,
         "checkout": cmd_checkout,
+        "serve": cmd_serve,
         "serve-export": cmd_serve_export,
         "merge": cmd_merge,
         "diff": cmd_diff,

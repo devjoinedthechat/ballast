@@ -17,8 +17,9 @@ import itertools
 import json
 import math
 import struct
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import ml_dtypes
 import numpy as np
@@ -153,6 +154,67 @@ def save(path: Path | str, tensors: dict[str, np.ndarray], metadata: dict[str, s
         f.write(encoded)
         for name in ordered:
             np.ascontiguousarray(tensors[name]).view(np.uint8).reshape(-1).tofile(f)
+
+
+def save_stream(
+    target: Path | str | BinaryIO,
+    specs: Mapping[str, tuple[str, Sequence[int]]],
+    produce: Callable[[str], np.ndarray],
+    metadata: dict[str, str] | None = None,
+) -> None:
+    """Write a file one tensor at a time.
+
+    The format puts every offset in the header, so the shapes and dtypes have to
+    be known before anything is written — but the values do not. `specs` gives
+    the shape of the file and `produce` supplies each tensor as its turn comes,
+    so peak memory is one tensor rather than the whole model. Writing a 70B
+    model otherwise means holding a 70B model.
+
+    Each tensor is checked against its declared spec as it arrives. A producer
+    that returns the wrong shape would otherwise write a file whose header lies.
+
+    `target` is a path or an open binary file, so the same code writes a shard
+    to disk and an adapter to a response body.
+    """
+    header: dict[str, Any] = {}
+    offset = 0
+    ordered = sorted(specs)
+    for name in ordered:
+        dtype, shape = specs[name]
+        if dtype not in DTYPES:
+            raise ValueError(f"{name!r} has unknown dtype {dtype!r}")
+        nbytes = math.prod(shape) * DTYPES[dtype].itemsize
+        header[name] = {"dtype": dtype, "shape": list(shape), "data_offsets": [offset, offset + nbytes]}
+        offset += nbytes
+    if metadata:
+        header["__metadata__"] = metadata
+
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * (-len(encoded) % 8)
+
+    def write(f: BinaryIO) -> None:
+        f.write(struct.pack("<Q", len(encoded)))
+        f.write(encoded)
+        for name in ordered:
+            dtype, shape = specs[name]
+            array = np.ascontiguousarray(produce(name))
+            if dtype_name(array.dtype) != dtype or tuple(array.shape) != tuple(shape):
+                raise ValueError(
+                    f"{name!r} was declared {dtype} {list(shape)} but produced "
+                    f"{dtype_name(array.dtype)} {list(array.shape)}"
+                )
+            f.write(array.view(np.uint8).reshape(-1).tobytes())
+            del array
+
+    if isinstance(target, (str, Path)):
+        with Path(target).open("wb") as f:
+            write(f)
+    else:
+        write(target)
+
+
+def specs_of(tensors: dict[str, np.ndarray]) -> dict[str, tuple[str, tuple[int, ...]]]:
+    return {name: (dtype_name(a.dtype), tuple(a.shape)) for name, a in tensors.items()}
 
 
 def load_dir(directory: Path | str) -> dict[str, np.ndarray]:

@@ -101,7 +101,7 @@ def test_lora_request_needs_vllm_and_says_so(store, rng, tmp_path):
     store.commit("t", adapter(rng), message="v1")
     item = serving.export(store, "t", "main", tmp_path / "loras")
     try:
-        import vllm  # noqa: F401, PLC0415
+        import vllm  # noqa: F401
     except ImportError:
         with pytest.raises(ImportError):
             serving.lora_request(item)

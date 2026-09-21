@@ -30,7 +30,7 @@ from ballast import merge as merging
 from ballast.store import Commit, Store
 
 # Parameters this resolver acts on. Anything else is recorded, not interpreted.
-ACTED_ON = frozenset({"weight", "density", "normalize", "lambda"})
+ACTED_ON = frozenset({"weight", "density", "normalize", "lambda", "gamma", "epsilon", "t"})
 
 
 class SliceMerge(ValueError):
@@ -118,18 +118,29 @@ def import_config(
         )
     density = densities[0] if densities else None
 
+    # SLERP interpolates from the base model to the other one, so the base is the
+    # first input whether or not the config lists it among `models`.
+    if method == "slerp" and config.get("base_model"):
+        base_ref = (refs or {}).get(config["base_model"], config["base_model"])
+        if base_ref not in [spec for spec, _ in inputs]:
+            inputs.insert(0, (base_ref, 1.0))
+
+    resolvable = method in merging.RESOLVABLE and not sliced
     provenance: dict[str, Any] = {"source": Path(path).name}
     for key in ("base_model", "dtype", "tokenizer_source", "out_dtype", "chat_template"):
         if config.get(key) is not None:
             provenance[key] = config[key]
-    extra = {k: v for k, v in defaults.items() if k not in ACTED_ON}
+    # A parameter is left out of provenance only when the resolver genuinely
+    # acted on all of it. Nothing is acted on in a recipe that cannot resolve,
+    # and a gradient is only acted on at its first point, so the list is kept.
+    acted = ACTED_ON if resolvable else frozenset()
+    extra = {key: value for key, value in defaults.items() if key not in acted or isinstance(value, list)}
     if extra:
         provenance["parameters"] = extra
     if sliced:
         provenance["slices"] = config["slices"]
         provenance["unresolvable"] = "slice merges compose layer ranges, not whole deltas"
 
-    resolvable = method in merging.RESOLVABLE and not sliced
     return store.merge(
         tenant,
         method if resolvable else f"{method}:slices" if sliced else method,
@@ -140,6 +151,9 @@ def import_config(
         seed=seed if method in merging.SEEDED and resolvable else None,
         normalize=_maybe_bool(defaults.get("normalize")),
         lambda_=_scalar(defaults.get("lambda", 1.0)),
+        gamma=_scalar(defaults["gamma"]) if "gamma" in defaults else None,
+        epsilon=_scalar(defaults["epsilon"]) if "epsilon" in defaults else None,
+        t=_scalar(defaults["t"]) if "t" in defaults and resolvable else None,
         provenance=provenance,
     )
 

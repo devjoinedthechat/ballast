@@ -27,21 +27,30 @@ from collections.abc import Sequence
 import blake3
 import numpy as np
 
-RESOLVABLE = ("linear", "task_arithmetic", "ties", "dare_ties", "dare_linear")
-RECORD_ONLY = (
+RESOLVABLE = (
+    "linear",
+    "task_arithmetic",
+    "ties",
+    "dare_ties",
+    "dare_linear",
     "slerp",
-    "passthrough",
     "breadcrumbs",
     "breadcrumbs_ties",
-    "model_stock",
     "della",
     "della_linear",
 )
-SEEDED = ("dare_ties", "dare_linear")
+RECORD_ONLY = ("passthrough", "model_stock", "nuslerp", "multislerp", "sce", "arcee_fusion")
+SEEDED = ("dare_ties", "dare_linear", "della", "della_linear")
 """Methods whose result depends on a random draw, so a view must store its seed."""
 
 DEFAULT_DENSITY = 0.2
+DEFAULT_GAMMA = 0.01
+"""Breadcrumbs: the share of largest-magnitude entries dropped as outliers."""
+DEFAULT_EPSILON = 0.15
+"""DELLA: how far the keep probability swings either side of the density."""
 EPS = 1e-7
+DOT_THRESHOLD = 0.9995
+"""Above this cosine the two tensors are colinear and interpolation is linear."""
 
 
 def linear(
@@ -58,6 +67,47 @@ def linear(
                 acc += weight * tensors[name].astype(np.float32)
         out[name] = acc.astype(ref.dtype)
     return out
+
+
+def slerp(inputs: Sequence[dict[str, np.ndarray]], t: float, strict: bool = True) -> dict[str, np.ndarray]:
+    """Spherical interpolation between exactly two inputs.
+
+    Interpolates along the arc between the two tensors rather than the chord,
+    which keeps the magnitude of the result closer to the magnitude of its
+    inputs. `t` is how far to travel, 0 giving the first input and 1 the second.
+
+    Two tensors that already point almost the same way have no meaningful arc —
+    the angle between them is numerically zero and the divisions below blow up —
+    so a cosine above `DOT_THRESHOLD` falls back to a straight line.
+    """
+    if len(inputs) != 2:
+        raise ValueError(f"slerp interpolates between exactly two inputs, got {len(inputs)}")
+    names, template = _names(inputs, strict)
+    out: dict[str, np.ndarray] = {}
+    for name in names:
+        ref = template[name]
+        v0 = inputs[0].get(name, np.zeros(ref.shape, dtype=ref.dtype)).astype(np.float32)
+        v1 = inputs[1].get(name, np.zeros(ref.shape, dtype=ref.dtype)).astype(np.float32)
+        out[name] = _slerp_one(t, v0, v1).astype(ref.dtype)
+    return out
+
+
+def _slerp_one(t: float, v0: np.ndarray, v1: np.ndarray) -> np.ndarray:
+    u0, u1 = _unit(v0), _unit(v1)
+    dot = float(np.sum(u0 * u1))
+    if abs(dot) > DOT_THRESHOLD:
+        return (1 - t) * v0 + t * v1
+    theta = np.arccos(dot)
+    sin_theta = np.sin(theta)
+    theta_t = theta * t
+    s0 = float(np.sin(theta - theta_t) / sin_theta)
+    s1 = float(np.sin(theta_t) / sin_theta)
+    return s0 * v0 + s1 * v1
+
+
+def _unit(v: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(v))
+    return v / norm if norm > 1e-8 else v
 
 
 def ties(
@@ -139,6 +189,68 @@ def dare_linear(
     )
 
 
+def breadcrumbs(
+    inputs: Sequence[dict[str, np.ndarray]],
+    weights: Sequence[float],
+    density: float = DEFAULT_DENSITY,
+    strict: bool = True,
+    gamma: float = DEFAULT_GAMMA,
+    elect: bool = False,
+    lambda_: float = 1.0,
+) -> dict[str, np.ndarray]:
+    """Model Breadcrumbs (Davari & Belilovsky, 2024): drop the tails, keep the middle.
+
+    TIES keeps the largest entries. Breadcrumbs argues the very largest are
+    outliers that carry noise rather than skill, so it removes the top `gamma`
+    fraction as well as the bottom, and merges what is left. `breadcrumbs_ties`
+    is the same sparsifier with TIES' sign election on top.
+    """
+    return _generalized(
+        inputs,
+        weights,
+        density,
+        strict,
+        sparsify="outliers",
+        elect=elect,
+        normalize=False,
+        gamma=gamma,
+        lambda_=lambda_,
+    )
+
+
+def della(
+    inputs: Sequence[dict[str, np.ndarray]],
+    weights: Sequence[float],
+    density: float = DEFAULT_DENSITY,
+    strict: bool = True,
+    seed: int = 0,
+    epsilon: float = DEFAULT_EPSILON,
+    elect: bool = True,
+    normalize: bool = True,
+    lambda_: float = 1.0,
+) -> dict[str, np.ndarray]:
+    """DELLA (Deep et al., 2024): drop by rank rather than uniformly.
+
+    DARE keeps every entry with the same probability. DELLA ranks entries by
+    magnitude within each row and makes the largest likelier to survive, sliding
+    the keep probability from `density - epsilon` at the smallest to
+    `density + epsilon` at the largest. Like DARE it draws a mask, so a view
+    carries its seed.
+    """
+    return _generalized(
+        inputs,
+        weights,
+        density,
+        strict,
+        sparsify="rank",
+        elect=elect,
+        normalize=normalize,
+        seed=seed,
+        epsilon=epsilon,
+        lambda_=lambda_,
+    )
+
+
 def _generalized(
     inputs: Sequence[dict[str, np.ndarray]],
     weights: Sequence[float],
@@ -150,9 +262,16 @@ def _generalized(
     normalize: bool,
     seed: int = 0,
     lambda_: float = 1.0,
+    gamma: float = DEFAULT_GAMMA,
+    epsilon: float = DEFAULT_EPSILON,
 ) -> dict[str, np.ndarray]:
     if not 0.0 < density <= 1.0:
         raise ValueError(f"density must be in (0, 1], got {density}")
+    if sparsify == "rank" and not density - epsilon > 0.0 and density + epsilon < 1.0:
+        raise ValueError(
+            f"epsilon must keep density +/- epsilon inside (0, 1); "
+            f"density {density} with epsilon {epsilon} does not"
+        )
     names, template = _names(inputs, strict)
     out: dict[str, np.ndarray] = {}
     for name in names:
@@ -165,6 +284,10 @@ def _generalized(
             value = tensors[name].astype(np.float32)
             if sparsify == "magnitude":
                 prepared.append(_trim(value, density))
+            elif sparsify == "outliers":
+                prepared.append(_trim_outliers(value, density, gamma))
+            elif sparsify == "rank":
+                prepared.append(_rank_drop(value, density, epsilon, _seed_for(seed, index, name)))
             else:
                 prepared.append(_drop_and_rescale(value, density, _seed_for(seed, index, name)))
 
@@ -222,6 +345,55 @@ def _drop_and_rescale(array: np.ndarray, density: float, seed: int) -> np.ndarra
     return masked * (before / after)
 
 
+def _trim_outliers(array: np.ndarray, density: float, gamma: float) -> np.ndarray:
+    """Keep the middle band: drop the largest `gamma` share and enough of the smallest.
+
+    When the density leaves no room for the outlier cut, the cut shrinks rather
+    than the target density, which is mergekit's own resolution.
+    """
+    if density >= 1.0 or array.size == 0:
+        return array
+    total = array.size
+    target = int(density * total)
+    top = int(gamma * total)
+    bottom = total - target - top
+    if bottom < 0:
+        top += bottom
+        bottom = 0
+    order = np.argsort(np.abs(array).ravel(), kind="stable")
+    keep = order[bottom : total - top] if top > 0 else order[bottom:]
+    mask = np.zeros(total, dtype=bool)
+    mask[keep] = True
+    return np.where(mask.reshape(array.shape), array, 0.0)
+
+
+def _rank_drop(array: np.ndarray, density: float, epsilon: float, seed: int) -> np.ndarray:
+    """Keep each entry with a probability that rises with its rank in its row.
+
+    Ranks run within axis 1, as mergekit's does, so a 1-D tensor is treated as a
+    single row. The L1 norm is restored afterwards, as in DARE.
+    """
+    if density >= 1.0 or array.size == 0:
+        return array
+    work = array.reshape(1, -1) if array.ndim < 2 else array
+    magnitudes = np.abs(work)
+    ranks = np.argsort(np.argsort(magnitudes, axis=1, kind="stable"), axis=1, kind="stable") + 1.0
+    low = ranks.min(axis=1, keepdims=True)
+    high = ranks.max(axis=1, keepdims=True)
+    span = np.where(high == low, 1.0, high - low)
+    rank_norm = np.clip((ranks - low) / span, 0.0, 1.0)
+    probs = (density - epsilon) + rank_norm * 2 * epsilon
+
+    rng = np.random.default_rng(seed)
+    mask = rng.random(work.shape) < probs
+    masked = np.where(mask, work, 0.0)
+    before = float(np.abs(work).sum())
+    after = float(np.abs(masked).sum())
+    if before >= EPS and after >= EPS:
+        masked = masked * (before / after)
+    return masked.reshape(array.shape)
+
+
 def _seed_for(seed: int, index: int, name: str) -> int:
     """A tensor's own seed, from the view's seed, the input's position and the name.
 
@@ -269,6 +441,9 @@ def resolve(
     seed: int | None = None,
     normalize: bool | None = None,
     lambda_: float = 1.0,
+    gamma: float = DEFAULT_GAMMA,
+    epsilon: float = DEFAULT_EPSILON,
+    t: float | None = None,
 ) -> dict[str, np.ndarray]:
     """Resolve a view.
 
@@ -279,12 +454,34 @@ def resolve(
     """
     if method in ("linear", "task_arithmetic"):
         return linear(inputs, weights, strict)
+    if method == "slerp":
+        if t is None:
+            raise ValueError("slerp needs a t; the view should carry one")
+        return slerp(inputs, t, strict)
     density = DEFAULT_DENSITY if density is None else density
+    if method in ("breadcrumbs", "breadcrumbs_ties"):
+        return breadcrumbs(
+            inputs, weights, density, strict, gamma, elect=method.endswith("_ties"), lambda_=lambda_
+        )
     if method == "ties":
         return ties(inputs, weights, density, strict, True if normalize is None else normalize, lambda_)
     if method in SEEDED:
         if seed is None:
             raise ValueError(f"{method!r} needs a seed to be reproducible; the view should carry one")
+        if method in ("della", "della_linear"):
+            elect = method == "della"
+            default_normalize = elect
+            return della(
+                inputs,
+                weights,
+                density,
+                strict,
+                seed,
+                epsilon,
+                elect,
+                default_normalize if normalize is None else normalize,
+                lambda_,
+            )
         if method == "dare_linear":
             return dare_linear(inputs, weights, density, strict, seed, lambda_)
         return dare_ties(

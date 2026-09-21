@@ -28,10 +28,11 @@ dependencies = ["numpy>=1.26", "ml_dtypes>=0.4", "blake3>=0.4", "pyyaml>=6", "zs
 peft = ["torch>=2.2", "transformers>=4.40", "peft>=0.11"]
 s3 = ["boto3>=1.34"]
 postgres = ["psycopg[binary]>=3.1"]
+serve = ["starlette>=0.37", "uvicorn>=0.30"]
 verify = ["torch>=2.2", "transformers>=4.40", "peft>=0.11", "mergekit>=0.1"]
 dev = [
     "pytest>=8", "ruff>=0.6", "mypy>=1.11", "types-PyYAML>=6", "hypothesis>=6",
-    "moto[s3]>=5", "boto3>=1.34", "psycopg[binary]>=3.1",
+    "moto[s3]>=5", "boto3>=1.34", "psycopg[binary]>=3.1", "starlette>=0.37", "httpx>=0.27",
 ]
 
 [project.scripts]
@@ -62,7 +63,7 @@ ignore = ["PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917", "PLR2004", "TRY
 "src/ballast/runners.py" = ["ARG002"]
 # The backend protocol names arguments some implementations do not need.
 "src/ballast/backends.py" = ["ARG002"]
-"tests/**" = ["S101", "S311", "PLR2004", "ARG001", "ARG002"]
+"tests/**" = ["S101", "S311", "PLR2004", "ARG001", "ARG002", "PLC0415"]
 # A by-hand verification script: imports heavy deps where they are used.
 "scripts/**" = ["PLC0415", "S603"]
 
@@ -75,7 +76,7 @@ warn_unused_ignores = false
 [[tool.mypy.overrides]]
 module = [
     "ml_dtypes", "blake3", "yaml", "peft", "peft.*", "transformers", "torch",
-    "boto3", "zstandard", "psycopg", "psycopg.*", "vllm", "vllm.*",
+    "boto3", "zstandard", "psycopg", "psycopg.*", "vllm", "vllm.*", "uvicorn",
 ]
 ignore_missing_imports = true
 

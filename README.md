@@ -16,7 +16,7 @@
 <p align="center">
   <a href="https://github.com/devjoinedthechat/ballast/actions/workflows/ci.yml"><img src="https://github.com/devjoinedthechat/ballast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%20%7C%203.12%20%7C%203.14-blue" alt="Python 3.10 | 3.12 | 3.14">
-  <img src="https://img.shields.io/badge/tests-157-brightgreen" alt="157 tests">
+  <img src="https://img.shields.io/badge/tests-197-brightgreen" alt="197 tests">
   <img src="https://img.shields.io/badge/verified%20against-mergekit%20%C2%B7%20PEFT%20%C2%B7%20Postgres-2e7d32" alt="Verified against mergekit, PEFT and Postgres">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0">
   <img src="https://img.shields.io/badge/status-pre--alpha-orange" alt="Status: pre-alpha">
@@ -93,8 +93,13 @@ reported as exactly that.
   the graph in SQLite or Postgres, each behind one interface. `fsck` re-hashes
   every block and checks every reference whichever pair you run.
 - **Ready to serve.** `serve-export` materialises deltas into the layout a
-  serving runtime loads, with a stable id per commit, and skips the views that
-  cannot resolve rather than failing the whole fleet.
+  serving runtime loads, with a stable id per commit. `ballast serve` offers the
+  same over HTTP, so a fleet that does not share a filesystem can pull by commit
+  id — an immutable response, cacheable for ever.
+- **Ten merge methods that resolve**, each matching mergekit's own functions
+  numerically: linear, task arithmetic, TIES, DARE, SLERP, breadcrumbs and DELLA.
+- **Bounded memory.** Tensors are read block by block and written one at a time,
+  so applying a delta to a 70B model costs one tensor, not a model.
 
 ## Quickstart
 
@@ -162,14 +167,26 @@ store.merge("acme", "ties", [("support", 0.6), ("finance", 0.4)], density=0.5, m
 ```
 
 Nothing is computed until `checkout`, and the result is cached until an input is
-deleted or a grant revoked. `linear`, `task_arithmetic`, `ties`, `dare_ties` and
-`dare_linear` resolve. `slerp`, `passthrough`, `della` and the rest are recorded
-for provenance and refuse to resolve, rather than quietly running as something else.
+deleted or a grant revoked.
 
-The DARE methods draw a random mask, so a view records the seed it was created
-with and resolves the same way every time. mergekit draws from the global torch
-RNG, which means two runs of the same recipe there produce different weights; a
-view that cannot be resolved twice is not a version of anything.
+| resolves | what it does |
+| --- | --- |
+| `linear`, `task_arithmetic` | weighted sum |
+| `ties` | trim to the largest, elect a sign, merge those that agree |
+| `slerp` | interpolate along the arc between two inputs, keeping their magnitude |
+| `breadcrumbs`, `breadcrumbs_ties` | drop the largest as outliers as well as the smallest |
+| `dare_ties`, `dare_linear` | drop at random, rescale to the original norm |
+| `della`, `della_linear` | drop at random, but weighted by rank within each row |
+
+`passthrough`, `model_stock`, `nuslerp`, `multislerp`, `sce` and `arcee_fusion`
+are recorded for provenance and refuse to resolve, rather than quietly running as
+something else. A test asserts the two lists never overlap, because an overlap
+would make the answer depend on the order of checks.
+
+The DARE and DELLA methods draw a random mask, so a view records the seed it was
+created with and resolves the same way every time. mergekit draws from the global
+torch RNG, which means two runs of the same recipe there produce different
+weights; a view that cannot be resolved twice is not a version of anything.
 
 A mergekit configuration imports as a view, each `model` entry mapped to a ref, so the
 recipe is stored as the thing it describes:
@@ -266,6 +283,21 @@ adapters by number will otherwise hold one delta twice under two ids. A view tha
 lost an input is named and skipped, and the exit code says some failed.
 `ballast.serving` offers the same in Python, including `lora_request()` for vLLM.
 
+Where the fleet does not share a filesystem with the store, serve it instead:
+
+```
+$ ballast --tenant acme serve --tokens ./tokens.json --port 8080
+$ curl -s localhost:8080/tenants/acme/loras | jq '.loras[0]'
+{ "ref": "support", "name": "acme-support", "int_id": 1078599923,
+  "commit": "a7b571bab537…", "url": "/tenants/acme/commits/a7b571bab537…/adapter" }
+```
+
+Reads only, because writing is a control-plane job that wants more authentication
+than one token. A commit id names exactly one set of tensors, so every response is
+immutable and carries `cache-control: immutable` and an ETag — cheap to put behind
+anything. A bearer token is scoped to the tenants it may read, and a request for
+another tenant is a 404 rather than a 403, because a 403 confirms the tenant exists.
+
 ## Storage
 
 ```python
@@ -296,6 +328,7 @@ the wrong answer for several.
 | `diff <a> <b> [--probe-set] [--threshold]` | weight change and, if fingerprinted, probe change |
 | `fingerprint <spec> --probes <file>` | run a probe set through the model and record the answers |
 | `serve-export [<spec>…] -o <dir>` | materialise for a serving runtime, with stable ids |
+| `serve [--tokens f] [--port n]` | read-only HTTP API a runtime can pull from |
 | `log` / `reflog` / `reset <ref> <spec>` | history, every ref move, rollback |
 | `grant <spec> --to <t>` / `revoke` / `grants` | cross-tenant sharing |
 | `forget [<spec>] --reason …` | delete a tenant or a commit, with a proof |
@@ -338,20 +371,24 @@ Not published to an index yet, so install from a checkout.
 
 What is not there:
 
-- **A daemon.** Everything is a library and a CLI. When this runs as a service
-  holding many tenants' deltas at gigabyte scale, `chunks.py` is the one module
-  to rewrite in a systems language — nothing above it touches a backend directly
-  — and the SQL above it does not change.
-- **A live connection to a running vLLM.** `serve-export` writes the directories
-  and ids a server loads, and `lora_request()` builds vLLM's own request object,
-  but nothing here talks to a server that is already up. vLLM is CUDA-first and
-  is not installed in CI, so that call is the one part of the hand-off tests do
-  not exercise.
-- **Merge methods beyond the five that resolve.** `slerp`, `della`,
-  `breadcrumbs`, `model_stock` and the slice form are read and recorded, and
-  refuse rather than approximate.
-- **Anything that makes a resolved view cheap at scale.** Views are cached per
-  manifest, but a deep stack still resolves its inputs the first time, in memory.
+- **Writes over HTTP.** `ballast serve` reads. Committing, merging and forgetting
+  are control-plane operations that want authentication with more to say than one
+  bearer token, and they are deliberately not exposed.
+- **A live connection to a running vLLM.** A runtime can discover and pull
+  adapters, and `lora_request()` builds vLLM's own request object, but nothing
+  here tells a server that is already up to load one. vLLM is CUDA-first and is
+  not installed in CI, so that call is the one part of the hand-off the tests do
+  not reach.
+- **Six merge methods.** `passthrough`, `model_stock`, `nuslerp`, `multislerp`,
+  `sce`, `arcee_fusion` and the slice form are read and recorded, and refuse
+  rather than approximate.
+- **A view resolved incrementally.** Leaves stream and a cached view streams from
+  its file, but resolving a view for the first time holds its inputs, because a
+  merge needs all of them.
+- **A systems-language core.** `chunks.py` is one module with a narrow interface
+  and nothing above it touches a backend directly, so it is the piece to rewrite
+  when a single node stops being enough. There is no evidence it is the
+  bottleneck yet, so it has not been.
 
 ## Install
 
@@ -360,6 +397,7 @@ uv pip install -e ".[dev]"       # store, tests, lint
 uv pip install -e ".[peft]"      # PeftRunner
 uv pip install -e ".[s3]"        # the S3 backend
 uv pip install -e ".[postgres]"  # the Postgres metadata backend
+uv pip install -e ".[serve]"     # ballast serve
 uv pip install -e ".[verify]"    # scripts/verify_real.py
 pytest -q
 ```

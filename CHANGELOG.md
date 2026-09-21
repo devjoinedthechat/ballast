@@ -9,6 +9,19 @@ API is not yet stable.
 
 ### Added
 
+- **Five more merge methods that resolve**, taking the total to ten: `slerp`,
+  `breadcrumbs`, `breadcrumbs_ties`, `della` and `della_linear`. Each is compared
+  against mergekit's own function numerically — the two deterministic sparsifiers
+  match to zero, SLERP to float32 epsilon, and DELLA's keep probabilities to 1e-8.
+- **`ballast serve`,** a read-only HTTP API a serving runtime can pull from: the
+  list of adapters to load with a stable id for each, the delta itself as
+  safetensors, and its adapter config. A commit id names one set of tensors, so
+  every response is immutable and carries an ETag. Bearer tokens are scoped to
+  tenants, and a refused tenant is a 404 rather than a 403.
+- **Bounded memory.** `save_stream` writes a file one tensor at a time,
+  `checkout_stream` reads one at a time, and `specs` describes a commit without
+  reading any of it. Applying a delta to a 70B model costs one tensor, not a model.
+
 - **Sub-tensor blocks.** Tensors are stored as fixed-size content-addressed
   blocks rather than whole, so a one-value edit to a large tensor stores one
   block. Blocks are compressed with zstd unless that does not help, and are
@@ -40,6 +53,13 @@ API is not yet stable.
   unobserved-change threshold with a similarity score for probes that moved.
 
 ### Fixed
+
+- **`RESOLVABLE` and `RECORD_ONLY` overlapped,** so whether a recipe ran or
+  refused depended on the order of checks inside `resolve`. A test now asserts
+  the two are disjoint.
+- **A parameter that could not be acted on was dropped from provenance** rather
+  than recorded, and a gradient reduced to its first value lost the rest of the
+  list. Both are kept now.
 
 - **A revoked grant kept serving cached results.** Cache invalidation followed
   only direct dependents, so a view built on a view kept resolving after the
